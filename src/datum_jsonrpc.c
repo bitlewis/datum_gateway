@@ -301,7 +301,6 @@ T_BITCOIND_NODE_CONFIG* bitcoind_get_active_node(global_config_t *cfg) {
 json_t *bitcoind_json_rpc_call_single(CURL *curl, T_BITCOIND_NODE_CONFIG *node, const char *rpc_req) {
 	char userpass[512];
 	long http_resp_code = -1;
-	int timeout_seconds = 2;  // Default fast timeout
 
 	// Build userpass from node config
 	if (node->rpcuser[0] != '\0' && node->rpcpassword[0] != '\0') {
@@ -318,21 +317,11 @@ json_t *bitcoind_json_rpc_call_single(CURL *curl, T_BITCOIND_NODE_CONFIG *node, 
 		userpass[0] = '\0';
 	}
 
-	// Detect slow operations that need longer timeouts
-	// submitblock and preciousblock can take >2s when node is processing/validating
-	if (strstr(rpc_req, "\"submitblock\"") || strstr(rpc_req, "\"preciousblock\"")) {
-		timeout_seconds = 30;  // 30 second timeout for block submission operations
-	}
-
-	// Set timeout based on operation type
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeout_seconds);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
-
-	json_t *j = json_rpc_call_full(curl, node->rpcurl, userpass, rpc_req, NULL, &http_resp_code);
-
-	// Reset to default timeout
+	// Use 5 second timeout (matching original upstream behavior)
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
+
+	json_t *j = json_rpc_call_full(curl, node->rpcurl, userpass, rpc_req, NULL, &http_resp_code);
 
 	if (j) return j;
 
@@ -342,13 +331,10 @@ json_t *bitcoind_json_rpc_call_single(CURL *curl, T_BITCOIND_NODE_CONFIG *node, 
 		if (F && fgets(userpass, sizeof(userpass), F) && userpass[0]) {
 			fclose(F);
 
-			curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeout_seconds);
-			curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
-
-			j = json_rpc_call(curl, node->rpcurl, userpass, rpc_req);
-
 			curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5);
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
+
+			j = json_rpc_call(curl, node->rpcurl, userpass, rpc_req);
 
 			return j;
 		}

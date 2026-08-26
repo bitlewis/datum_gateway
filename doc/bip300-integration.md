@@ -125,6 +125,37 @@ told otherwise. A pool that shows its miners a governance page should not be
 silently voting yes on their behalf, so the pool must set an explicit policy at
 startup rather than inherit that one.
 
+## Settled decisions
+
+**Who votes.** The pool, through its admin section, for now. Voting power in
+BIP300 is hashrate, so a pool voting one way exercises the voting power of
+every miner pointed at it — that is a real transfer of governance and should be
+visible on the page rather than implied. Per-miner voting is the intended
+direction and the wire format below keeps room for it, but it is not this
+change.
+
+**What the gateway carries.** Every coinbase message the pool sends, and full
+templates including them. The gateway is a courier: it places bytes it was
+handed and does not interpret them. That keeps a gateway working across
+additions to BIP300 without a rebuild, and keeps the pool the only place that
+needs to understand the messages.
+
+**What a miner's gateway needs.** A pruned node and nothing else — verified,
+not assumed: this pool mines off a node with prune=10000 that serves templates
+happily. No txindex, no unpruned chain, no enforcer of their own. On alphanet
+they additionally need deprecatedrpc=getblocktemplate, because the node
+otherwise refuses templates and directs the caller to an enforcer.
+
+Requiring an enforcer per gateway would have meant ~900 GB per miner, which
+would push everyone onto the pool's own gateway and defeat what DATUM is for.
+
+**How support is negotiated.** The gateway already sends
+DATUM_PROTOCOL_VERSION as its user agent and the pool already reads it, so a
+fork declaring itself there is enough. A pool talking to a gateway that has not
+declared support sends no commitment section and mines without votes, rather
+than sending something the old parser would reject — which would cost that
+gateway its payout list, not just its vote.
+
 ## Protocol change
 
 Raising the script cap is a change to the DATUM wire format, so both ends have

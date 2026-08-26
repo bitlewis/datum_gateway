@@ -53,7 +53,7 @@ void preciousblock(CURL *curl, char *blockhash) {
 	json_t *json;
 	char rpc_data[384];
 	
-	snprintf(rpc_data, sizeof(rpc_data), "{\"method\":\"preciousblock\",\"params\":[\"%s\"],\"id\":1}", blockhash);
+	snprintf(rpc_data, sizeof(rpc_data), "{\"jsonrpc\":\"2.0\",\"method\":\"preciousblock\",\"params\":[\"%s\"],\"id\":1}", blockhash);
 	json = bitcoind_json_rpc_call(curl, &datum_config, rpc_data);
 	if (!json) return;
 	

@@ -131,6 +131,127 @@ void datum_template_clear(T_DATUM_TEMPLATE_DATA* p) {
 	p->txns = p->local_data;
 }
 
+// Read a Bitcoin varint. Returns the value and advances *p, or -1 past the end.
+static int64_t gbt_varint(const unsigned char *b, size_t len, size_t *p) {
+	if (*p >= len) return -1;
+	unsigned char n = b[*p]; (*p)++;
+	if (n < 0xfd) return n;
+	if (n == 0xfd) {
+		if (*p + 2 > len) return -1;
+		int64_t v = (int64_t)b[*p] | ((int64_t)b[*p+1] << 8); *p += 2; return v;
+	}
+	if (n == 0xfe) {
+		if (*p + 4 > len) return -1;
+		int64_t v = 0; for (int i = 0; i < 4; i++) v |= (int64_t)b[*p+i] << (8*i);
+		*p += 4; return v;
+	}
+	if (*p + 8 > len) return -1;
+	int64_t v = 0; for (int i = 0; i < 8; i++) v |= (int64_t)b[*p+i] << (8*i);
+	*p += 8; return v;
+}
+
+// Take what we need from a coinbase the template server built for us.
+//
+// An enforcer serves getblocktemplate in coinbasetxn mode: rather than telling
+// us what the coinbase may pay and letting us build it, it hands over a
+// finished one. It has to. The BMM auction and the sidechain ACKs are decided
+// together with the transaction set, and a block carrying an M8 BMM request
+// whose matching M7 accept is missing from the coinbase is valid Bitcoin and
+// invalid on a drivechain. Another eCash pool lost ten blocks that way.
+//
+// But a finished coinbase is the one thing DATUM cannot accept, because
+// building it from the pool's payout list is what DATUM is for. So we keep the
+// two things only the enforcer knows and discard the rest:
+//
+//   value        the sum of its outputs, which is subsidy plus the fees of
+//                its transaction set. Not the node's coinbasevalue -- that
+//                belongs to a different set of transactions and would be
+//                wrong by however much the two disagree.
+//   commitments  its zero-value OP_RETURNs, minus the witness commitment,
+//                which we derive ourselves from the same transactions.
+//
+// Its payout output is dropped on the floor. That is ours to build.
+//
+// Returns false if the transaction will not parse, which must fail the whole
+// template: a template we half-read is a block we cannot pay correctly.
+bool datum_template_parse_coinbasetxn(T_DATUM_TEMPLATE_DATA *tdata, const char *hex) {
+	size_t hlen = strlen(hex);
+	if (hlen < 20 || (hlen & 1)) {
+		DLOG_ERROR("coinbasetxn is not a whole number of bytes (%zu chars)", hlen);
+		return false;
+	}
+	size_t len = hlen >> 1;
+	unsigned char *b = calloc(1, len);
+	if (!b) { DLOG_ERROR("Could not allocate for coinbasetxn"); return false; }
+	for (size_t i = 0; i < len; i++) b[i] = hex2bin_uchar(&hex[i<<1]);
+
+	bool ok = false;
+	size_t p = 4; // version
+	if (p + 2 <= len && b[p] == 0x00 && b[p+1] == 0x01) p += 2; // segwit marker+flag
+
+	int64_t nin = gbt_varint(b, len, &p);
+	if (nin < 0) { DLOG_ERROR("coinbasetxn: bad input count"); goto done; }
+	for (int64_t i = 0; i < nin; i++) {
+		p += 36;                                    // prevout
+		int64_t sl = gbt_varint(b, len, &p);
+		if (sl < 0 || p + (size_t)sl + 4 > len) { DLOG_ERROR("coinbasetxn: truncated input %lld", (long long)i); goto done; }
+		p += (size_t)sl + 4;                        // script + sequence
+	}
+
+	int64_t nout = gbt_varint(b, len, &p);
+	if (nout < 0) { DLOG_ERROR("coinbasetxn: bad output count"); goto done; }
+
+	uint64_t total = 0;
+	tdata->commitments_count = 0;
+	for (int64_t i = 0; i < nout; i++) {
+		if (p + 8 > len) { DLOG_ERROR("coinbasetxn: truncated value on output %lld", (long long)i); goto done; }
+		uint64_t val = 0;
+		for (int k = 0; k < 8; k++) val |= (uint64_t)b[p+k] << (8*k);
+		p += 8;
+		int64_t sl = gbt_varint(b, len, &p);
+		if (sl < 0 || p + (size_t)sl > len) { DLOG_ERROR("coinbasetxn: truncated script on output %lld", (long long)i); goto done; }
+		const unsigned char *spk = &b[p];
+		size_t spk_len = (size_t)sl;
+		p += spk_len;
+
+		total += val;
+
+		// A commitment pays nothing and says something. Anything with value is
+		// the enforcer paying itself and is not ours to carry.
+		if (val != 0 || spk_len < 1 || spk[0] != 0x6a) continue;
+		// The witness commitment is OP_RETURN, a 36-byte push, then aa21a9ed.
+		// We build our own from the same transactions, so carrying the
+		// enforcer's would put two of them in one coinbase.
+		if (spk_len >= 6 && spk[1] == 0x24 &&
+		    spk[2] == 0xaa && spk[3] == 0x21 && spk[4] == 0xa9 && spk[5] == 0xed) continue;
+
+		if (tdata->commitments_count >= DATUM_MAX_COMMITMENTS) {
+			// Refusing beats truncating. A dropped commitment is a vote that
+			// silently did not happen, and a dropped M7 is an invalid block.
+			DLOG_ERROR("coinbasetxn carries more than %d commitments", DATUM_MAX_COMMITMENTS);
+			goto done;
+		}
+		if (spk_len > DATUM_MAX_COMMITMENT_SCRIPT) {
+			DLOG_ERROR("coinbasetxn commitment is %zu bytes, max %d", spk_len, DATUM_MAX_COMMITMENT_SCRIPT);
+			goto done;
+		}
+		memcpy(tdata->commitments[tdata->commitments_count].output_script, spk, spk_len);
+		tdata->commitments[tdata->commitments_count].output_script_len = (int)spk_len;
+		tdata->commitments_count++;
+	}
+
+	if (!total) { DLOG_ERROR("coinbasetxn pays nothing; refusing the template"); goto done; }
+
+	tdata->coinbasevalue = total;
+	tdata->from_enforcer = true;
+	ok = true;
+	DLOG_DEBUG("coinbasetxn: value %"PRIu64" sats, %d commitment(s) carried",
+	           tdata->coinbasevalue, tdata->commitments_count);
+done:
+	free(b);
+	return ok;
+}
+
 T_DATUM_TEMPLATE_DATA *get_next_template_ptr(void) {
 	T_DATUM_TEMPLATE_DATA *p;
 	
@@ -146,6 +267,54 @@ T_DATUM_TEMPLATE_DATA *get_next_template_ptr(void) {
 	}
 	
 	return p;
+}
+
+// Does every BMM accept in our coinbase have its request in this block?
+//
+// This is the check that the 996403 fork needed and did not have. An M7 BMM
+// accept commits to a sidechain block that some M8 request bid for, and the
+// two belong in the same block. Ship the accept without the request and the
+// result is valid Bitcoin -- the node takes it, builds on it, reports nothing
+// wrong -- and invalid on the drivechain. A pool lost ten blocks and 31.54 ECX
+// over three hours that way while its monitoring said healthy eighty-six
+// times.
+//
+// We match on the sidechain block hash rather than on BIP301's field layout.
+// The hash is 32 contiguous bytes somewhere inside the accept and the request
+// names the same 32 bytes, so if any 32-byte window of the accept appears in
+// some transaction, the request is present. Parsing the layout properly would
+// be more precise and would also mean that a detail we got wrong rejects
+// blocks that were fine. Sliding a window cannot do that: the failure it
+// reports is a hash that is nowhere in the block.
+bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata) {
+	for (int c = 0; c < tdata->commitments_count; c++) {
+		const unsigned char *scr = tdata->commitments[c].output_script;
+		int slen = tdata->commitments[c].output_script_len;
+		// OP_RETURN, a push, then the M7 tag.
+		if (slen < 6 + 33) continue;
+		if (scr[0] != 0x6a) continue;
+		if (!(scr[2] == 0xd1 && scr[3] == 0x61 && scr[4] == 0x73 && scr[5] == 0x68)) continue;
+
+		bool backed = false;
+		for (int w = 6; w + 32 <= slen && !backed; w++) {
+			for (uint32_t t = 0; t < tdata->txn_count; t++) {
+				const unsigned char *d = tdata->txns[t].txn_data_binary;
+				uint32_t dl = tdata->txns[t].size;
+				if (!d || dl < 32) continue;
+				for (uint32_t o = 0; o + 32 <= dl; o++) {
+					if (!memcmp(&d[o], &scr[w], 32)) { backed = true; break; }
+				}
+				if (backed) break;
+			}
+		}
+		if (!backed) {
+			DLOG_ERROR("Template has a BMM accept whose request is not in the block. Refusing it: "
+			           "this builds a block the node accepts and the enforcer rejects, which is how "
+			           "a pool mines an orphan and is told everything is fine.");
+			return false;
+		}
+	}
+	return true;
 }
 
 T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
@@ -166,10 +335,20 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 		return NULL;
 	}
 	
+	tdata->commitments_count = 0;
+	tdata->from_enforcer = false;
 	tdata->coinbasevalue = json_integer_value(json_object_get(gbt, "coinbasevalue"));
 	if (!tdata->coinbasevalue) {
-		DLOG_ERROR("Missing data from GBT JSON (coinbasevalue)");
-		return NULL;
+		// No coinbasevalue means a server that builds the coinbase itself. A
+		// BIP300 enforcer does, and sends coinbasetxn in its place; anything
+		// else that omits both is simply broken.
+		json_t *cbtxn = json_object_get(gbt, "coinbasetxn");
+		const char *cbhex = cbtxn ? json_string_value(json_object_get(cbtxn, "data")) : NULL;
+		if (!cbhex) {
+			DLOG_ERROR("Missing data from GBT JSON (coinbasevalue, and no coinbasetxn to take it from)");
+			return NULL;
+		}
+		if (!datum_template_parse_coinbasetxn(tdata, cbhex)) return NULL;
 	}
 	
 	tdata->mintime = json_integer_value(json_object_get(gbt, "mintime"));
@@ -271,6 +450,19 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	tdata->txn_data_offset = sizeof(T_DATUM_TEMPLATE_TXN)*tdata->txn_count;
 	if (tdata->txn_count > 0) {
 		if (tdata->txn_count > 16383) {
+			if (tdata->from_enforcer) {
+				// Truncating keeps the first 16383 transactions, and an M8 BMM
+				// request is an ordinary transaction that can sit anywhere in
+				// the list. Drop one while the M7 accept that answers it stays
+				// in our coinbase and the block is good Bitcoin and invalid on
+				// the drivechain -- which looks exactly like a healthy block
+				// right up until it is orphaned.
+				//
+				// Serving nothing is the lesser failure. It is loud, and the
+				// gateway can fall back to the node.
+				DLOG_ERROR("Enforcer template has %d transactions, over the 16383 limit. Refusing it rather than truncating: dropping an M8 while keeping its M7 builds an invalid block.", (int)tdata->txn_count);
+				return NULL;
+			}
 			DLOG_WARN("DATUM Gateway does not support blocks with more than 16383 transactions! %d txns in template. Truncating template to 16383 transactions.", (int)tdata->txn_count);
 			tdata->txn_count = 16383;
 		}
@@ -346,6 +538,10 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 		}
 	}
 	
+	// Last, because it needs both the coinbase commitments and the parsed
+	// transactions to compare them against.
+	if (!datum_template_bmm_accepts_are_backed(tdata)) return NULL;
+	
 	return tdata;
 }
 
@@ -365,7 +561,7 @@ void *datum_gateway_fallback_notifier(void *args) {
 	DLOG_DEBUG("Fallback notifier thread ready.");
 	
 	while(1) {
-		snprintf(req, sizeof(req), "{\"jsonrpc\":\"1.0\",\"id\":\"%"PRIu64"\",\"method\":\"getbestblockhash\",\"params\":[]}", current_time_millis());
+		snprintf(req, sizeof(req), "{\"jsonrpc\":\"2.0\",\"id\":\"%"PRIu64"\",\"method\":\"getbestblockhash\",\"params\":[]}", current_time_millis());
 		gbbh = bitcoind_json_rpc_call(tcurl, &datum_config, req);
 		if (gbbh) {
 			res_val = json_object_get(gbbh, "result");
@@ -446,7 +642,7 @@ void *datum_gateway_template_thread(void *args) {
 		i++;
 		
 		// fetch latest template
-		snprintf(gbt_req, sizeof(gbt_req), "{\"method\":\"getblocktemplate\",\"params\":[{\"rules\":[\"segwit\"]}],\"id\":%"PRIu64"}",(uint64_t)((uint64_t)time(NULL)<<(uint64_t)8)|(uint64_t)(i&255));
+		snprintf(gbt_req, sizeof(gbt_req), "{\"jsonrpc\":\"2.0\",\"method\":\"getblocktemplate\",\"params\":[{\"rules\":[\"segwit\"],\"capabilities\":[\"coinbasetxn\"]}],\"id\":%"PRIu64"}",(uint64_t)((uint64_t)time(NULL)<<(uint64_t)8)|(uint64_t)(i&255));
 		gbt = bitcoind_json_rpc_call(tcurl, &datum_config, gbt_req);
 		
 		if (!gbt) {

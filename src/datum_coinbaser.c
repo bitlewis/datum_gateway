@@ -787,6 +787,41 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	}
 }
 
+// Seed a job's commitments from its template.
+//
+// Two things can supply commitments and only one can win. The pool sends them
+// over DATUM when the gateway takes templates from a plain node -- the pool
+// asks the enforcer itself and forwards the bytes. An enforcer template
+// carries its own, already chosen alongside the transaction set they belong
+// to.
+//
+// When both are available the template wins, and the pool's are dropped. They
+// are the same votes fetched twice, but the template's are the ones coupled to
+// this block's transactions: an M7 accept only means anything next to the M8
+// requests the enforcer included. Carrying both would put two of each in one
+// coinbase.
+//
+// Returns the number of bytes they will take in the coinbase.
+static int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
+	s->commitments_count = 0;
+	s->commitments_size = 0;
+	if (!s->block_template || s->block_template->commitments_count <= 0) return 0;
+
+	for (int i = 0; i < s->block_template->commitments_count && i < DATUM_MAX_COMMITMENTS; i++) {
+		int clen = s->block_template->commitments[i].output_script_len;
+		if (clen < 1 || clen > DATUM_MAX_COMMITMENT_SCRIPT) continue;
+		memcpy(s->commitments[i].output_script, s->block_template->commitments[i].output_script, clen);
+		s->commitments[i].output_script_len = clen;
+		// 8 bytes of value, the script's own length prefix, then the script.
+		s->commitments_size += 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
+		s->commitments_count++;
+	}
+	if (s->commitments_count) {
+		DLOG_DEBUG("Template carries %d commitment(s), %d bytes", s->commitments_count, s->commitments_size);
+	}
+	return s->commitments_size;
+}
+
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free) {
 	// parse raw outputs from DATUM connection into a useful coinbaser
 	uint64_t outval = 0;
@@ -799,8 +834,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	if (!coinbaser) {
 		DLOG_WARN("Coinbaser is NULL Using default/empty");
 		s->available_coinbase_outputs_count = 0;
-		s->commitments_count = 0;
-		s->commitments_size = 0;
+		commitments_from_template(s);
 		return 0;
 	}
 	
@@ -808,8 +842,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		// 0 outputs possible
 		DLOG_WARN("Coinbaser length is invalid (too short). Using default/empty");
 		s->available_coinbase_outputs_count = 0;
-		s->commitments_count = 0;
-		s->commitments_size = 0;
+		commitments_from_template(s);
 		return 0;
 	}
 	
@@ -827,8 +860,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	//
 	// Two-byte lengths because a payout's one byte caps at 255 and a wide M4
 	// bundle vote runs past 500.
-	s->commitments_count = 0;
-	s->commitments_size = 0;
+	bool from_template = commitments_from_template(s) > 0;
 	if (datum_id & 0x80) {
 		datum_id &= 0x7F;
 		if (cidx >= cblen) {
@@ -857,15 +889,24 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 				s->available_coinbase_outputs_count = 0;
 				return 0;
 			}
-			memcpy(s->commitments[ci].output_script, &coinbaser[cidx], clen); cidx += clen;
-			s->commitments[ci].output_script_len = clen;
+			const unsigned char *cscript = &coinbaser[cidx]; cidx += clen;
+			// The bytes are walked either way -- the payout records begin
+			// after them -- but they are only kept when the template did not
+			// already supply its own.
+			if (from_template) continue;
+			memcpy(s->commitments[s->commitments_count].output_script, cscript, clen);
+			s->commitments[s->commitments_count].output_script_len = clen;
 			// 8 bytes of value + the script's own length prefix + the script.
 			// Scripts past 0x4B need a longer prefix; commitments routinely
 			// are, so this is counted rather than assumed to be one byte.
 			s->commitments_size += 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
 			s->commitments_count++;
 		}
-		DLOG_DEBUG("Coinbaser carries %d commitment(s), %d bytes", s->commitments_count, s->commitments_size);
+		if (from_template && ccount) {
+			DLOG_DEBUG("Ignoring %d commitment(s) from the pool: this template brought its own", ccount);
+		} else {
+			DLOG_DEBUG("Coinbaser carries %d commitment(s), %d bytes", s->commitments_count, s->commitments_size);
+		}
 	}
 	
 	while (cidx < cblen) {

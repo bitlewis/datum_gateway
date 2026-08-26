@@ -50,6 +50,23 @@
 
 #include "datum_gateway.h"
 
+// BIP300/301 coinbase commitments, kept apart from payouts because they are a
+// different kind of thing: zero value, never trimmed, and opaque to us. The
+// gateway is a courier here — it places bytes the pool handed it and does not
+// interpret them, so a new BIP300 message needs no change on this side.
+//
+// The script buffer is far larger than a payout's 64 bytes. An M4 bundle vote
+// carries up to two bytes per sidechain across 256 slots, so ~517 bytes is
+// reachable and a 64-byte cap would silently drop exactly the votes that
+// matter once governance is busy.
+#define DATUM_MAX_COMMITMENTS 24
+#define DATUM_MAX_COMMITMENT_SCRIPT 560
+
+typedef struct {
+	unsigned char output_script[DATUM_MAX_COMMITMENT_SCRIPT];
+	int output_script_len;
+} T_DATUM_TXN_COMMITMENT;
+
 #define MAX_TEMPLATES_IN_MEMORY 32 // 32*30 seconds = 16 minutes of work remembered
 
 // consensus rules:
@@ -181,6 +198,21 @@ typedef struct {
 	T_DATUM_TEMPLATE_TXN *txns;
 	uint32_t	txn_data_offset;
 	
+	// BIP300/301 commitments lifted out of the template's own coinbase.
+	//
+	// Only an enforcer fills these. It serves getblocktemplate in coinbasetxn
+	// mode -- it hands back a finished coinbase because the BMM auction and
+	// the sidechain ACKs are decisions coupled to the transaction set it just
+	// chose, and it cannot delegate them. We keep the decisions and throw the
+	// rest of its coinbase away: the payout is ours to build and the witness
+	// commitment we derive ourselves.
+	T_DATUM_TXN_COMMITMENT commitments[DATUM_MAX_COMMITMENTS];
+	int		commitments_count;
+	// Set when the template arrived in coinbasetxn mode. Distinct from having
+	// commitments: an enforcer with nothing to vote on this block sends none,
+	// and its transaction ordering still must not be disturbed.
+	bool		from_enforcer;
+
 	// Pointer to allocated data for this particular template copy
 	void		*local_data;
 	uint32_t	local_data_size;
@@ -194,5 +226,8 @@ void *datum_gateway_template_thread(void *args);
 void datum_blocktemplates_notifynew_sighandler();
 void datum_blocktemplates_notifynew(const char *prevhash, int height);
 void datum_blocktemplates_notify_othercause();
+
+bool datum_template_parse_coinbasetxn(T_DATUM_TEMPLATE_DATA *tdata, const char *hex);
+bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata);
 
 #endif

@@ -119,23 +119,6 @@ typedef struct {
 	int sigops;
 } T_DATUM_TXN_OUTPUT;
 
-// BIP300/301 coinbase commitments, kept apart from payouts because they are a
-// different kind of thing: zero value, never trimmed, and opaque to us. The
-// gateway is a courier here — it places bytes the pool handed it and does not
-// interpret them, so a new BIP300 message needs no change on this side.
-//
-// The script buffer is far larger than a payout's 64 bytes. An M4 bundle vote
-// carries up to two bytes per sidechain across 256 slots, so ~517 bytes is
-// reachable and a 64-byte cap would silently drop exactly the votes that
-// matter once governance is busy.
-#define DATUM_MAX_COMMITMENTS 24
-#define DATUM_MAX_COMMITMENT_SCRIPT 560
-
-typedef struct {
-	unsigned char output_script[DATUM_MAX_COMMITMENT_SCRIPT];
-	int output_script_len;
-} T_DATUM_TXN_COMMITMENT;
-
 typedef struct {
 	int global_index;
 	

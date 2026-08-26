@@ -2164,7 +2164,7 @@ int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t 
 	}
 	
 	ptr = submitblock_req;
-	ptr += sprintf(ptr, "{\"jsonrpc\":\"1.0\",\"id\":\"%llu\",\"method\":\"submitblock\",\"params\":[\"",(unsigned long long)time(NULL));
+	ptr += sprintf(ptr, "{\"jsonrpc\":\"2.0\",\"id\":\"%llu\",\"method\":\"submitblock\",\"params\":[\"",(unsigned long long)time(NULL));
 	for(i=0;i<80;i++) {
 		ptr += sprintf(ptr, "%2.2x", block_header[i]);
 	}

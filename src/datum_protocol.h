@@ -51,7 +51,7 @@
 // the v3 coinbaser, and a pool not seeing it sends the old format rather than
 // something this parser would reject -- which would cost the gateway its
 // payout list, not merely its votes.
-#define DATUM_PROTOCOL_VERSION "v0.4.1-beta+bip300"
+#define DATUM_PROTOCOL_VERSION "v0.4.2-beta+bip300"
 #define DATUM_PROTOCOL_CONNECT_TIMEOUT 30
 
 #define DATUM_PROTOCOL_MAX_CMD_DATA_SIZE 4194304 // 2^22 - protocol limit!

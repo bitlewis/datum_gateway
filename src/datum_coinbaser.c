@@ -193,6 +193,16 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// either way, we want to start out coinb2 with outputs
 	i = remaining_size;
 	j = remaining_size;
+	// Commitments come out of the budget before any payout is measured
+	// against it. The loop below trims the payout list to fit a worker's
+	// coinbase limit, which is right for payouts -- one that does not fit is
+	// deferred and paid from a later block -- but a commitment that does not
+	// fit is a vote that silently did not happen. So they are not in that
+	// loop: their space is taken first and what remains is what payouts get.
+	if (s->commitments_count > 0) {
+		i -= s->commitments_size;
+		if (i < 0) i = 0;
+	}
 	if (special_coinb1) {
 		i2 = (300 - cb1idx[coinbase_index])>>1;
 		if (i2 < 0) i2 = 0;
@@ -222,6 +232,8 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	}
 	
 	// "m" outputs fit
+	m += s->commitments_count;
+
 	if (space_for_en_in_coinbase) {
 		// we'll start the empty coinb2 with the "sequence"
 		m+=2; // pool addr + witness
@@ -277,6 +289,22 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 		}
 	}
 	
+	// Commitments, written after the payouts and before the pool's own output.
+	// Zero value, so they take nothing from miners; their cost is the bytes,
+	// which were reserved out of the budget before payouts were counted.
+	//
+	// The bytes are the pool's, verbatim. Nothing here parses or validates
+	// them: a gateway that understood BIP300 would need rebuilding every time
+	// BIP300 gained a message, and the pool is the end that already knows.
+	for (k = 0; k < s->commitments_count; k++) {
+		cb2idx[coinbase_index] += sprintf(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], "0000000000000000");
+		cb2idx[coinbase_index] += append_bitcoin_varint_hex(s->commitments[k].output_script_len, &s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]]);
+		for (i = 0; i < s->commitments[k].output_script_len; i++) {
+			uchar_to_hex(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], s->commitments[k].output_script[i]);
+			cb2idx[coinbase_index] += 2;
+		}
+	}
+
 	// this should never happen, but...
 	if (mval > s->coinbase_value) {
 		DLOG_ERROR("Attempting to pay more than we have available in the generation txn! --- %"PRIu64" sats available, %"PRIu64" sats to miners", s->coinbase_value, mval);
@@ -771,6 +799,8 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	if (!coinbaser) {
 		DLOG_WARN("Coinbaser is NULL Using default/empty");
 		s->available_coinbase_outputs_count = 0;
+		s->commitments_count = 0;
+		s->commitments_size = 0;
 		return 0;
 	}
 	
@@ -778,12 +808,65 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		// 0 outputs possible
 		DLOG_WARN("Coinbaser length is invalid (too short). Using default/empty");
 		s->available_coinbase_outputs_count = 0;
+		s->commitments_count = 0;
+		s->commitments_size = 0;
 		return 0;
 	}
 	
 	DLOG_DEBUG("Coinbaser v2 size %d", cblen);
 	
 	datum_id = coinbaser[cidx]; cidx++;
+	
+	// v3: the pool set the high bit of the datum id to say a commitment
+	// section leads the payload. The pool only does this for a gateway that
+	// declared support in its user agent, so an unmodified gateway never sees
+	// it and never has to recognise it.
+	//
+	//   [1 byte count]
+	//   count x ( [2 bytes script length LE] [script] )
+	//
+	// Two-byte lengths because a payout's one byte caps at 255 and a wide M4
+	// bundle vote runs past 500.
+	s->commitments_count = 0;
+	s->commitments_size = 0;
+	if (datum_id & 0x80) {
+		datum_id &= 0x7F;
+		if (cidx >= cblen) {
+			DLOG_ERROR("Coinbaser claims commitments but ends before the count. Using default/empty");
+			s->available_coinbase_outputs_count = 0;
+			return 0;
+		}
+		int ccount = coinbaser[cidx]; cidx++;
+		if (ccount > DATUM_MAX_COMMITMENTS) {
+			// Refusing beats truncating: a dropped commitment is a vote that
+			// silently did not happen, and mining without it looks identical
+			// to mining with it.
+			DLOG_ERROR("Coinbaser has %d commitments, max %d. Using default/empty", ccount, DATUM_MAX_COMMITMENTS);
+			s->available_coinbase_outputs_count = 0;
+			return 0;
+		}
+		for (int ci = 0; ci < ccount; ci++) {
+			if (cidx + 2 > cblen) {
+				DLOG_ERROR("Coinbaser commitment %d has no length. Using default/empty", ci);
+				s->available_coinbase_outputs_count = 0;
+				return 0;
+			}
+			int clen = (int)coinbaser[cidx] | ((int)coinbaser[cidx+1] << 8); cidx += 2;
+			if (clen < 1 || clen > DATUM_MAX_COMMITMENT_SCRIPT || cidx + clen > cblen) {
+				DLOG_ERROR("Coinbaser commitment %d length (%d) is invalid. Using default/empty", ci, clen);
+				s->available_coinbase_outputs_count = 0;
+				return 0;
+			}
+			memcpy(s->commitments[ci].output_script, &coinbaser[cidx], clen); cidx += clen;
+			s->commitments[ci].output_script_len = clen;
+			// 8 bytes of value + the script's own length prefix + the script.
+			// Scripts past 0x4B need a longer prefix; commitments routinely
+			// are, so this is counted rather than assumed to be one byte.
+			s->commitments_size += 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
+			s->commitments_count++;
+		}
+		DLOG_DEBUG("Coinbaser carries %d commitment(s), %d bytes", s->commitments_count, s->commitments_size);
+	}
 	
 	while (cidx < cblen) {
 		if (cidx + 8 + 1 > cblen) {

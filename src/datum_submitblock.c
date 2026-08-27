@@ -49,12 +49,22 @@ int submit_block_triggered = 0;
 const char *submitblock_ptr = NULL;
 char submitblock_hash[256] = { 0 };
 
-void preciousblock(CURL *curl, char *blockhash) {
+// preciousblock tells a node to prefer our block when two race at one height.
+//
+// It goes wherever the block went. A BIP300 enforcer proxies submitblock to
+// Bitcoin Core but implements nothing else -- preciousblock comes back "method
+// not found" -- so a gateway taking templates from an enforcer silently loses
+// the tiebreaker unless this follows the block to a node that has it.
+void preciousblock(CURL *curl, const char *url, char *blockhash) {
 	json_t *json;
 	char rpc_data[384];
 	
 	snprintf(rpc_data, sizeof(rpc_data), "{\"jsonrpc\":\"2.0\",\"method\":\"preciousblock\",\"params\":[\"%s\"],\"id\":1}", blockhash);
-	json = bitcoind_json_rpc_call(curl, &datum_config, rpc_data);
+	if (url) {
+		json = json_rpc_call(curl, url, NULL, rpc_data);
+	} else {
+		json = bitcoind_json_rpc_call(curl, &datum_config, rpc_data);
+	}
 	if (!json) return;
 	
 	json_decref(json);
@@ -84,8 +94,8 @@ void datum_submitblock_doit(CURL *tcurl, char *url, const char *submitblock_req,
 		json_decref(r);
 	}
 	
-	// precious block!
-	preciousblock(tcurl, submitblock_hash);
+	// precious block, to the same place the block went.
+	preciousblock(tcurl, url, submitblock_hash);
 }
 
 void *datum_submitblock_thread(void *ptr) {

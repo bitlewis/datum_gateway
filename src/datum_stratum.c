@@ -1442,6 +1442,39 @@ int client_mining_configure(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	return 0;
 }
 
+// Apply a "d=NNNN" difficulty floor from the stratum password.
+//
+// A floor rather than a fixed difficulty: vardiff may still raise a rig that
+// is submitting too often, which is what keeps a mistyped value from costing
+// the pool a flood of shares. Rounded down to a power of two because that is
+// what the share target actually is — an arbitrary number would be silently
+// rounded anyway, and rounding down never asks a rig for more work than it
+// requested.
+//
+// Anything unparseable is ignored rather than refused. The password field has
+// never been validated and a rig whose password happens to start with "d=" for
+// unrelated reasons should keep mining, not be disconnected.
+static void datum_stratum_set_diff_floor(T_DATUM_CLIENT_DATA *c, const char *s) {
+	T_DATUM_MINER_DATA * const m = c->app_client_data;
+	char *end = NULL;
+	unsigned long long v;
+	uint64_t pot = 1;
+	
+	if (!s || !s[0]) return;
+	errno = 0;
+	v = strtoull(s, &end, 10);
+	if (errno || end == s || v == 0) return;
+	// Bounded well below anything a real rig would ask for. A value large
+	// enough to overflow the target table would stop the rig producing
+	// entirely, which is not what someone typing a number was asking for.
+	if (v > (1ULL << 48)) return;
+	
+	while ((pot << 1) <= v) pot <<= 1;
+	m->forced_high_min_diff = pot;
+	if (m->current_diff < pot) m->current_diff = pot;
+	DLOG_DEBUG("client set difficulty floor %"PRIu64" from password", pot);
+}
+
 int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj) {
 	char s[256];
 	const char *username_s;
@@ -1462,12 +1495,19 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	strncpy(m->last_auth_username, username_s, sizeof(m->last_auth_username) - 1);
 	m->last_auth_username[sizeof(m->last_auth_username)-1] = 0;
 	
-	// The password, which stratum otherwise discards.
+	// The password field, which does two jobs and is not checked for either.
 	//
-	// Forwarded to the pool so a miner can later prove this address is theirs
-	// without signing anything — the proof most of them cannot give, because
-	// they mine to an exchange and hold no key. The pool records it hashed,
-	// once per rig, and never overwrites it.
+	// "d=NNNN" is a difficulty floor, the long-standing convention for a rig
+	// that wants more work per share than vardiff would settle on. It is
+	// applied here and deliberately not forwarded: every worker's difficulty
+	// is published on the pool's own pages, so a password anyone can read off
+	// a website proves nothing about who owns the address.
+	//
+	// Anything else is forwarded to the pool, which keeps the first one each
+	// rig connects with — hashed, never overwritten — so its owner can later
+	// prove the address is theirs. That proof is the one most miners here
+	// cannot otherwise give, because they mine to an exchange and hold no key
+	// to sign with.
 	//
 	// Sent once per connection rather than kept: nothing here should hold a
 	// plaintext credential a moment longer than it takes to hand it over.
@@ -1475,7 +1515,11 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 		json_t *pw = json_array_get(params_obj, 1);
 		const char *pw_s = pw ? json_string_value(pw) : NULL;
 		if (pw_s && pw_s[0]) {
-			datum_protocol_send_worker_auth(username_s, pw_s);
+			if ((pw_s[0] == 'd' || pw_s[0] == 'D') && pw_s[1] == '=') {
+				datum_stratum_set_diff_floor(c, pw_s + 2);
+			} else {
+				datum_protocol_send_worker_auth(username_s, pw_s);
+			}
 		}
 	}
 	

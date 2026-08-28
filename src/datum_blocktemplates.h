@@ -229,5 +229,10 @@ void datum_blocktemplates_notify_othercause();
 
 bool datum_template_parse_coinbasetxn(T_DATUM_TEMPLATE_DATA *tdata, const char *hex);
 bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata);
+// Checks one commitment script against a transaction set. Exposed because the
+// coinbaser has to apply the same rule to commitments the pool sends, which
+// never pass through the template parser.
+bool datum_template_commitment_is_backed(const unsigned char *scr, int slen,
+                                         const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count);
 
 #endif

@@ -894,6 +894,33 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			// after them -- but they are only kept when the template did not
 			// already supply its own.
 			if (from_template) continue;
+
+			// The same rule the template parser applies, applied here too.
+			//
+			// A commitment the pool sends has not been near that parser, and a
+			// BMM accept is only valid beside the M8 request it answers. The
+			// pool decides its commitments against its own node's transaction
+			// set; a gateway building templates from a different node has a
+			// different set, so an accept that was backed there may be
+			// unbacked here. The result is a block this node accepts, builds
+			// on, and reports nothing wrong about, while the enforcer rejects
+			// it and everything after it is orphaned.
+			//
+			// The pool sends only sidechain and bundle votes today, which
+			// commit to no transaction and always pass -- so this changes
+			// nothing now and is the check that has to already be here on the
+			// day that stops being true.
+			//
+			// Dropped rather than failing the whole coinbaser: refusing that
+			// would take the payout list with it, and one vote not cast is a
+			// far smaller loss than a block that pays nobody correctly.
+			if (!datum_template_commitment_is_backed(cscript, clen,
+			        s->block_template ? s->block_template->txns : NULL,
+			        s->block_template ? s->block_template->txn_count : 0)) {
+				DLOG_ERROR("Pool sent a BMM accept whose request is not in our block. Dropping it: "
+				           "carrying it would build a block our node accepts and the enforcer rejects.");
+				continue;
+			}
 			memcpy(s->commitments[s->commitments_count].output_script, cscript, clen);
 			s->commitments[s->commitments_count].output_script_len = clen;
 			// 8 bytes of value + the script's own length prefix + the script.

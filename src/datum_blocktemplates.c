@@ -286,33 +286,42 @@ T_DATUM_TEMPLATE_DATA *get_next_template_ptr(void) {
 // be more precise and would also mean that a detail we got wrong rejects
 // blocks that were fine. Sliding a window cannot do that: the failure it
 // reports is a hash that is nowhere in the block.
-bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata) {
-	for (int c = 0; c < tdata->commitments_count; c++) {
-		const unsigned char *scr = tdata->commitments[c].output_script;
-		int slen = tdata->commitments[c].output_script_len;
-		// OP_RETURN, a push, then the M7 tag.
-		if (slen < 6 + 33) continue;
-		if (scr[0] != 0x6a) continue;
-		if (!(scr[2] == 0xd1 && scr[3] == 0x61 && scr[4] == 0x73 && scr[5] == 0x68)) continue;
+// Is one commitment safe to put in a coinbase beside this transaction set?
+//
+// Only a BMM accept can be unsafe. M2 and M4 commit to no transaction at all,
+// so they are always fine and must be reported so -- a guard that failed on
+// them would stop the pool voting entirely.
+bool datum_template_commitment_is_backed(const unsigned char *scr, int slen,
+                                         const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count) {
+	// OP_RETURN, a push, then the M7 tag. Anything else commits to nothing.
+	if (slen < 6 + 33) return true;
+	if (scr[0] != 0x6a) return true;
+	if (!(scr[2] == 0xd1 && scr[3] == 0x61 && scr[4] == 0x73 && scr[5] == 0x68)) return true;
 
-		bool backed = false;
-		for (int w = 6; w + 32 <= slen && !backed; w++) {
-			for (uint32_t t = 0; t < tdata->txn_count; t++) {
-				const unsigned char *d = tdata->txns[t].txn_data_binary;
-				uint32_t dl = tdata->txns[t].size;
-				if (!d || dl < 32) continue;
-				for (uint32_t o = 0; o + 32 <= dl; o++) {
-					if (!memcmp(&d[o], &scr[w], 32)) { backed = true; break; }
-				}
-				if (backed) break;
+	for (int w = 6; w + 32 <= slen; w++) {
+		for (uint32_t t = 0; t < txn_count; t++) {
+			const unsigned char *d = txns[t].txn_data_binary;
+			uint32_t dl = txns[t].size;
+			if (!d || dl < 32) continue;
+			for (uint32_t o = 0; o + 32 <= dl; o++) {
+				if (!memcmp(&d[o], &scr[w], 32)) return true;
 			}
 		}
-		if (!backed) {
-			DLOG_ERROR("Template has a BMM accept whose request is not in the block. Refusing it: "
-			           "this builds a block the node accepts and the enforcer rejects, which is how "
-			           "a pool mines an orphan and is told everything is fine.");
-			return false;
+	}
+	return false;
+}
+
+bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata) {
+	for (int c = 0; c < tdata->commitments_count; c++) {
+		if (datum_template_commitment_is_backed(tdata->commitments[c].output_script,
+		                                        tdata->commitments[c].output_script_len,
+		                                        tdata->txns, tdata->txn_count)) {
+			continue;
 		}
+		DLOG_ERROR("Template has a BMM accept whose request is not in the block. Refusing it: "
+		           "this builds a block the node accepts and the enforcer rejects, which is how "
+		           "a pool mines an orphan and is told everything is fine.");
+		return false;
 	}
 	return true;
 }

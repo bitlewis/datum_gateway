@@ -165,6 +165,52 @@ static void a_bmm_accept_needs_its_request_in_the_block(void) {
 	printf("  a BMM accept without its request in the block is refused\n");
 }
 
+// The rule the coinbaser now applies to commitments the pool sends.
+//
+// Those never pass through the template parser, so the guard that protects
+// enforcer templates was silently not protecting them. It holds today only
+// because the pool sends votes and never accepts -- an invariant nothing in
+// the code enforced, and this is what enforces it.
+static void a_pool_sent_accept_is_checked_against_our_own_block(void) {
+	unsigned char m8[64] = { 0 };
+	for (int i = 0; i < 32; i++) m8[16 + i] = (unsigned char)(0xA0 + i);
+	unsigned char unrelated[64] = { 0 };
+	memset(unrelated, 0x5a, sizeof(unrelated));
+
+	unsigned char m7[256];
+	const char *hex = SPK_M7;
+	int len = (int)strlen(hex) / 2;
+	for (int i = 0; i < len; i++) {
+		unsigned v; sscanf(&hex[i*2], "%2x", &v);
+		m7[i] = (unsigned char)v;
+	}
+
+	T_DATUM_TEMPLATE_TXN backed = { .txn_data_binary = m8, .size = sizeof(m8) };
+	assert(datum_template_commitment_is_backed(m7, len, &backed, 1));
+
+	// The case that matters: the pool's node had the request, ours does not.
+	T_DATUM_TEMPLATE_TXN theirs = { .txn_data_binary = unrelated, .size = sizeof(unrelated) };
+	assert(!datum_template_commitment_is_backed(m7, len, &theirs, 1));
+
+	// And with no transactions at all, which is what an empty-block template
+	// between two blocks looks like.
+	assert(!datum_template_commitment_is_backed(m7, len, NULL, 0));
+
+	// Votes commit to no transaction and must always pass, or applying this
+	// rule to the pool's commitments would stop it voting through any gateway
+	// that has no enforcer of its own.
+	unsigned char m2[256];
+	hex = SPK_M2;
+	len = (int)strlen(hex) / 2;
+	for (int i = 0; i < len; i++) {
+		unsigned v; sscanf(&hex[i*2], "%2x", &v);
+		m2[i] = (unsigned char)v;
+	}
+	assert(datum_template_commitment_is_backed(m2, len, NULL, 0));
+
+	printf("  a pool-sent BMM accept is checked against our own transactions\n");
+}
+
 static void commitments_without_bmm_are_left_alone(void) {
 	// M2 and M4 commit to no transaction, so the backing rule must not touch
 	// them. A guard that failed here would stop the pool voting at all.
@@ -208,6 +254,7 @@ void datum_blocktemplates_tests(void) {
 	a_truncated_coinbase_is_refused();
 	too_many_commitments_is_refused_not_truncated();
 	a_bmm_accept_needs_its_request_in_the_block();
+	a_pool_sent_accept_is_checked_against_our_own_block();
 	commitments_without_bmm_are_left_alone();
 	a_real_enforcer_coinbase();
 }

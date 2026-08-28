@@ -1462,6 +1462,23 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	strncpy(m->last_auth_username, username_s, sizeof(m->last_auth_username) - 1);
 	m->last_auth_username[sizeof(m->last_auth_username)-1] = 0;
 	
+	// The password, which stratum otherwise discards.
+	//
+	// Forwarded to the pool so a miner can later prove this address is theirs
+	// without signing anything — the proof most of them cannot give, because
+	// they mine to an exchange and hold no key. The pool records it hashed,
+	// once per rig, and never overwrites it.
+	//
+	// Sent once per connection rather than kept: nothing here should hold a
+	// plaintext credential a moment longer than it takes to hand it over.
+	{
+		json_t *pw = json_array_get(params_obj, 1);
+		const char *pw_s = pw ? json_string_value(pw) : NULL;
+		if (pw_s && pw_s[0]) {
+			datum_protocol_send_worker_auth(username_s, pw_s);
+		}
+	}
+	
 	snprintf(s, sizeof(s), "{\"error\":null,\"id\":%"PRIu64",\"result\":true}\n", id);
 	datum_socket_send_string_to_client(c, s);
 	

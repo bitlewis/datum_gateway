@@ -265,6 +265,51 @@ int datum_protocol_mining_cmd(void *data, int len) {
 	return 0;
 }
 
+// Forward the stratum credentials a rig authorised with.
+//
+// Stratum throws the password away, which is why no pool has ever been able to
+// use it. It is the one thing a miner already shares with the pool that an
+// impostor does not, so the pool keeps it — hashed, once per rig, never
+// overwritten — as the proof behind "this address is mine". That matters most
+// for the many miners who pay to an exchange address and therefore have no key
+// to sign a message with.
+//
+// Sent once per connection, right after authorize. The frame is sealed like
+// every other post-handshake frame, so the password is no more exposed on the
+// wire than the shares beside it.
+//
+// A rig that authorised without a password sends nothing: there is nothing to
+// record, and an empty credential must never become a claimable one.
+int datum_protocol_send_worker_auth(const char *username, const char *password) {
+	unsigned char msg[512 + crypto_box_MACBYTES];
+	int i = 0, ulen, plen, j;
+	
+	if (datum_protocol_client_active != 3) return 0;
+	if (!username || !password || !password[0]) return 0;
+	
+	ulen = strlen(username);
+	plen = strlen(password);
+	// Bounded well inside msg so the padding below always fits. A username or
+	// password longer than this is not truncated and re-sent as something
+	// else — it is dropped, because a partial credential that happened to
+	// match would be worse than none.
+	if (ulen > 200 || plen > 200) return 0;
+	
+	msg[0] = 0x30; i++;
+	memcpy(&msg[i], username, ulen); i += ulen;
+	msg[i] = 0; i++;
+	memcpy(&msg[i], password, plen); i += plen;
+	msg[i] = 0; i++;
+	
+	// Random padding, as every other sub-command does: without it the frame
+	// length would leak the length of the password to anyone counting bytes.
+	j = 1 + (rand() % 80);
+	memset(&msg[i], rand(), j);
+	i += j;
+	
+	return datum_protocol_mining_cmd(msg, i);
+}
+
 pthread_mutex_t datum_protocol_coinbaser_fetch_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t datum_protocol_coinbaser_fetch_cond = PTHREAD_COND_INITIALIZER;
 unsigned char datum_coinbaser_v2_response_buf[2][32768] = { 0 };

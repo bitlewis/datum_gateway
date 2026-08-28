@@ -125,6 +125,12 @@ int datum_encrypt_generate_keys(DATUM_ENC_KEYS *keys);
 bool datum_protocol_is_active(void);
 void datum_increment_session_nonce(void *s);
 int datum_protocol_fetch_coinbaser(uint64_t value);
+// Forward the stratum credentials a rig authorised with, once per connection.
+//
+// Sub-command 0x30 — this fork's own, not in upstream DATUM. A pool that does
+// not know it logs an unknown sub-command and carries on, so sending it costs
+// nothing against an upstream pool.
+int datum_protocol_send_worker_auth(const char *username, const char *password);
 int datum_protocol_coinbaser_fetch(void *s);
 int datum_protocol_pow_submit(
 	const T_DATUM_CLIENT_DATA *c,

@@ -44,10 +44,10 @@ void datum_stratum_mod_username_tests() {
 	const char * const s_umods = "{\"x\":{\"addrA\": 0.3}, \"abc\":{\"addrB\":0.3,\"addrC\":0.3},\":)\":{\"\":0.5}}";
 	json_error_t err;
 	json_t * const j_umods = JSON_LOADS(s_umods, &err);
-	assert(j_umods);
+	datum_test(j_umods);
 	struct datum_username_mod *umods = NULL;
 	int ret = datum_config_parse_username_mods(&umods, j_umods, false);
-	assert(ret == 1);
+	datum_test(ret == 1);
 	json_decref(j_umods);
 	datum_config.stratum_username_mod = umods;
 	

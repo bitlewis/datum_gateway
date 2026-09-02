@@ -59,8 +59,8 @@ void datum_conf_test_parse_username_mods__(const unsigned int code_line, json_t 
 	json_decref(j_input);
 	datum_test_(ret == expected_ret, input, code_line, "return value");
 	if (ret != 1) {
-		assert(!umods);
-		assert(!expected_umods);
+		datum_test(!umods);
+		datum_test(!expected_umods);
 		return;
 	}
 	
@@ -77,7 +77,7 @@ void datum_conf_test_parse_username_mods__(const unsigned int code_line, json_t 
 		}
 		datum_test_(datum_username_mods_find(umods, expected_umods->modname, umod->modname_len) == umod, input, code_line, "modname search");
 		struct datum_addr_range *range = umod->ranges;
-		assert(range);
+		datum_test(range);
 		char *last_p = &umod->modname[umod->modname_len];
 		for (struct datum_test_username_mods_range *expected_range = expected_umods->ranges; expected_range->addr; ++expected_range) {
 			if (!datum_test_(range->addr, input, code_line, "premature end of range list")) {
@@ -105,7 +105,7 @@ void datum_conf_test_parse_username_mods__(const unsigned int code_line, json_t 
 void datum_conf_test_parse_username_mods_(const unsigned int code_line, const char * const input, const int expected_ret, const struct datum_test_username_mods *expected_umods) {
 	json_error_t err;
 	json_t * const j_input = JSON_LOADS(input, &err);
-	assert(j_input);
+	datum_test(j_input);
 	datum_conf_test_parse_username_mods__(code_line, j_input, input, expected_ret, expected_umods);
 }
 

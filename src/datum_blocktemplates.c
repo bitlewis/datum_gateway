@@ -298,13 +298,24 @@ bool datum_template_commitment_is_backed(const unsigned char *scr, int slen,
 	if (scr[0] != 0x6a) return true;
 	if (!(scr[2] == 0xd1 && scr[3] == 0x61 && scr[4] == 0x73 && scr[5] == 0x68)) return true;
 
-	for (int w = 6; w + 32 <= slen; w++) {
-		for (uint32_t t = 0; t < txn_count; t++) {
-			const unsigned char *d = txns[t].txn_data_binary;
-			uint32_t dl = txns[t].size;
-			if (!d || dl < 32) continue;
-			for (uint32_t o = 0; o + 32 <= dl; o++) {
-				if (!memcmp(&d[o], &scr[w], 32)) return true;
+	// Transactions outermost, windows innermost, so the block body is walked
+	// once instead of once per window -- a 560-byte commitment has ~523 of
+	// them, and re-reading megabytes that many times is the whole cost here.
+	//
+	// The body is still the long axis, so each offset is first checked against
+	// a table of the bytes any window can start with. Almost every offset
+	// fails that and never reaches a comparison.
+	bool first_byte[256] = { false };
+	for (int w = 6; w + 32 <= slen; w++) first_byte[scr[w]] = true;
+
+	for (uint32_t t = 0; t < txn_count; t++) {
+		const unsigned char *d = txns[t].txn_data_binary;
+		uint32_t dl = txns[t].size;
+		if (!d || dl < 32) continue;
+		for (uint32_t o = 0; o + 32 <= dl; o++) {
+			if (!first_byte[d[o]]) continue;
+			for (int w = 6; w + 32 <= slen; w++) {
+				if (d[o] == scr[w] && !memcmp(&d[o], &scr[w], 32)) return true;
 			}
 		}
 	}
@@ -347,17 +358,31 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	tdata->commitments_count = 0;
 	tdata->from_enforcer = false;
 	tdata->coinbasevalue = json_integer_value(json_object_get(gbt, "coinbasevalue"));
-	if (!tdata->coinbasevalue) {
-		// No coinbasevalue means a server that builds the coinbase itself. A
-		// BIP300 enforcer does, and sends coinbasetxn in its place; anything
-		// else that omits both is simply broken.
+	{
+		// coinbasetxn is parsed whenever it is there, not only when
+		// coinbasevalue is missing. An enforcer that sends both used to have
+		// its commitments dropped on the floor -- the votes and the BMM
+		// accepts with them -- because the parser was never reached.
 		json_t *cbtxn = json_object_get(gbt, "coinbasetxn");
 		const char *cbhex = cbtxn ? json_string_value(json_object_get(cbtxn, "data")) : NULL;
 		if (!cbhex) {
-			DLOG_ERROR("Missing data from GBT JSON (coinbasevalue, and no coinbasetxn to take it from)");
-			return NULL;
+			if (!tdata->coinbasevalue) {
+				DLOG_ERROR("Missing data from GBT JSON (coinbasevalue, and no coinbasetxn to take it from)");
+				return NULL;
+			}
+		} else {
+			const uint64_t declared = tdata->coinbasevalue;
+			if (!datum_template_parse_coinbasetxn(tdata, cbhex)) return NULL;
+			if (declared && declared != tdata->coinbasevalue) {
+				// coinbasevalue is what the node says we may pay out, so it
+				// wins; the commitments the coinbasetxn brought are kept
+				// either way, since nothing else carries them.
+				DLOG_WARN("Template disagrees with itself: coinbasevalue %"PRIu64" sats, coinbasetxn pays %"PRIu64". "
+				          "Using coinbasevalue and keeping the coinbasetxn's commitments.",
+				          declared, tdata->coinbasevalue);
+				tdata->coinbasevalue = declared;
+			}
 		}
-		if (!datum_template_parse_coinbasetxn(tdata, cbhex)) return NULL;
 	}
 	
 	tdata->mintime = json_integer_value(json_object_get(gbt, "mintime"));

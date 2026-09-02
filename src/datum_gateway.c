@@ -135,6 +135,13 @@ void handle_sigusr1(int sig) {
 
 const char * const *datum_argv;
 
+// Read from the socket accept loop on another thread, written only here.
+static volatile bool datum_stratum_rejecting = false;
+
+bool datum_gateway_stratum_rejecting(void) {
+	return datum_stratum_rejecting;
+}
+
 int main(const int argc, const char * const * const argv) {
 	datum_argv = argv;
 	
@@ -145,7 +152,6 @@ int main(const int argc, const char * const * const argv) {
 	int fail_retries=0;
 	struct sigaction sa;
 	uint64_t last_datum_protocol_connect_tsms = 0;
-	bool rejecting_stratum = false;
 	uint32_t next_reconnect_attempt_ms = 5000;
 	
 	// listen for block notifications
@@ -223,6 +229,11 @@ int main(const int argc, const char * const * const argv) {
 	if (datum_config.datum_pooled_mining_only && (!datum_protocol_is_active())) {
 		DLOG_ERROR("DATUM server connection could not be established.");
 		fflush(stdout);
+		// A gateway that has never reached the pool is not riding out a blip,
+		// it is unable to serve anyone, so it starts out turning miners away.
+		// The grace below is for losing a link that was working; it is not a
+		// grace on never having had one. Cleared the moment the pool answers.
+		fail_retries = 2;
 	}
 	
 	DLOG_DEBUG("Starting template fetcher thread");
@@ -260,13 +271,16 @@ int main(const int argc, const char * const * const argv) {
 		}
 		
 		if (datum_config.datum_pooled_mining_only && (fail_retries >= 2) && (!datum_protocol_is_active())) {
-			if (!rejecting_stratum) {
+			if (!datum_stratum_rejecting) {
 				DLOG_WARN("Configured for pooled mining only, and connection lost to DATUM server!  Shutting down Stratum v1 server until DATUM connection reestablished.");
-				rejecting_stratum = true;
+				datum_stratum_rejecting = true;
 				datum_stratum_v1_shutdown_all();
 			}
 		} else {
-			rejecting_stratum = false;
+			if (datum_stratum_rejecting) {
+				DLOG_INFO("DATUM connection reestablished. Accepting Stratum v1 connections again.");
+			}
+			datum_stratum_rejecting = false;
 		}
 		
 		if ((datum_config.datum_pool_host[0] != 0) && (!datum_protocol_thread_is_active())) {

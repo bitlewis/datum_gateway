@@ -1470,6 +1470,14 @@ static void datum_stratum_set_diff_floor(T_DATUM_CLIENT_DATA *c, const char *s) 
 	if (v > (1ULL << 48)) return;
 	
 	while ((pot << 1) <= v) pot <<= 1;
+	// Only ever raise. A floor already set is there because something knows
+	// better than the password does -- NiceHash is pinned to 524288 by its
+	// user agent -- and letting a "d=1024" lower it hands vardiff a floor it
+	// then walks down into a share flood from a client that cannot take it.
+	if (pot <= m->forced_high_min_diff) {
+		DLOG_DEBUG("client asked for difficulty floor %"PRIu64", keeping the existing %"PRIu64, pot, m->forced_high_min_diff);
+		return;
+	}
 	m->forced_high_min_diff = pot;
 	if (m->current_diff < pot) m->current_diff = pot;
 	DLOG_DEBUG("client set difficulty floor %"PRIu64" from password", pot);
@@ -1517,7 +1525,8 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 		if (pw_s && pw_s[0]) {
 			if ((pw_s[0] == 'd' || pw_s[0] == 'D') && pw_s[1] == '=') {
 				datum_stratum_set_diff_floor(c, pw_s + 2);
-			} else {
+			} else if (!m->worker_auth_sent) {
+				m->worker_auth_sent = true;
 				datum_protocol_send_worker_auth(username_s, pw_s);
 			}
 		}
@@ -1795,6 +1804,9 @@ int client_mining_subscribe(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	
 	// set default diff
 	m->current_diff = datum_config.stratum_v1_vardiff_min;
+	// A client that authorised before it subscribed already has its floor, and
+	// this reset would drop it back to the vardiff minimum.
+	if (m->forced_high_min_diff > m->current_diff) m->current_diff = m->forced_high_min_diff;
 	
 	// default to the antminer workaround, which appears to be universally compatible
 	// except for NiceHash.

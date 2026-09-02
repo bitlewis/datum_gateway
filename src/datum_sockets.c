@@ -734,7 +734,14 @@ void *datum_gateway_listener_thread(void *arg) {
 	for (;;) {
 		nfds = epoll_wait(epollfd, events, MAX_EVENTS, 100);
 		if (nfds) {
-			if (datum_config.datum_pooled_mining_only && (!datum_protocol_is_active())) {
+			// Not datum_protocol_is_active() directly. That is true the
+			// instant the link drops, so a pool restarting for two seconds
+			// refused every miner that happened to redial in that window --
+			// and a rental platform that gets refused backs its order off and
+			// rebuilds it a rig at a time, costing twenty minutes of hashrate
+			// for a two-second outage. The main loop already decides when an
+			// outage has lasted long enough to stop being a blip; ask it.
+			if (datum_gateway_stratum_rejecting()) {
 				curtime_tsms = current_time_millis(); // we only need this if we're rejecting connections
 				if (!rejecting_now) {
 					last_reject_msg_tsms = curtime_tsms - 5000; // first disconnect triggers msg

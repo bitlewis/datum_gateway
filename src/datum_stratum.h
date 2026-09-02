@@ -233,6 +233,11 @@ typedef struct {
 	
 	bool authorized;
 	bool subscribed;
+	// worker_auth_sent: the rig's password has been forwarded to the pool
+	// once on this connection. A rig authorises once; a stream of authorize
+	// calls is not a rig, and each forward costs an encrypted send under the
+	// lock every share on this gateway waits for.
+	bool worker_auth_sent;
 	uint64_t subscribe_tsms;
 	
 	uint64_t last_sent_diff;

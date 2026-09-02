@@ -42,4 +42,16 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block);
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free);
 
+// The 4-byte BIP300 message tag a commitment carries, or false if the script is
+// not shaped like one. Exposed for the tests: which tag a commitment holds is
+// what decides whether the pool's vote replaces it.
+bool datum_commitment_tag(const unsigned char *script, int len, unsigned char out[4]);
+
+// Drop every commitment on the job carrying this tag, keeping the rest.
+void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[4]);
+
+// Entries in an M4's upvote vector, or -1 where it carries none. Exposed for
+// the tests: a vector of the wrong length is an invalid block.
+int datum_m4_entry_count(const unsigned char *script, int len);
+
 #endif

@@ -59,6 +59,19 @@
 
 void datum_print_banner(void);
 
+/**
+ * Whether the Stratum server is currently turning miners away.
+ *
+ * Pooled-mining-only means the gateway must not hand out work it cannot get
+ * from the pool, but a pool that restarts is down for a second or two, not
+ * gone. The main loop already rides that out for the miners it has -- it only
+ * disconnects them once reconnecting has failed twice -- and this is the same
+ * judgement, published so the accept path can ask rather than deciding for
+ * itself. A miner that reconnects during a restart is then treated exactly
+ * like one that never dropped: held, and given work when the link returns.
+ */
+bool datum_gateway_stratum_rejecting(void);
+
 extern const char *datum_gateway_config_filename;
 
 extern const char * const *datum_argv;

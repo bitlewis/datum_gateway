@@ -199,9 +199,37 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// deferred and paid from a later block -- but a commitment that does not
 	// fit is a vote that silently did not happen. So they are not in that
 	// loop: their space is taken first and what remains is what payouts get.
+	//
+	// Taken from BOTH budgets. The count loop (i) and the emit loop (j) are
+	// byte-identical on purpose, because the output count is written before
+	// the outputs are: whatever the first loop counts, the second must write,
+	// no more and no fewer. Reducing only i let the second loop fit payouts
+	// the first had not counted, so once enough miners were owed that a
+	// commitment displaced one, the coinbase declared fewer outputs than it
+	// carried. That is an invalid block the gateway believes it found.
+	//
+	// All or nothing. A commitment set that does not fit this coinbase type
+	// is left out of it entirely: a low-capacity rig then mines a block that
+	// abstains, which is legal, rather than one larger than it said it could
+	// carry, which it will not mine at all.
+	int commit_count = 0, commit_size = 0;
 	if (s->commitments_count > 0) {
-		i -= s->commitments_size;
-		if (i < 0) i = 0;
+		if (s->commitments_size <= remaining_size &&
+		    (s->commitments_size * 2) + 1024 <= STRATUM_COINBASE2_MAX_LEN) {
+			commit_count = s->commitments_count;
+			commit_size = s->commitments_size;
+		} else {
+			// Once per change, not once per job: a job is built every few
+			// seconds and this condition can hold for a whole template.
+			static int warned_size[MAX_COINBASE_TYPES];
+			if (warned_size[coinbase_index] != s->commitments_size) {
+				warned_size[coinbase_index] = s->commitments_size;
+				DLOG_WARN("Coinbase type %d cannot carry %d commitment(s) (%d bytes) in a %d byte budget; this type mines without them",
+				          coinbase_index, s->commitments_count, s->commitments_size, remaining_size);
+			}
+		}
+		i -= commit_size;
+		j -= commit_size;
 	}
 	if (special_coinb1) {
 		i2 = (300 - cb1idx[coinbase_index])>>1;
@@ -232,7 +260,7 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	}
 	
 	// "m" outputs fit
-	m += s->commitments_count;
+	m += commit_count;
 
 	if (space_for_en_in_coinbase) {
 		// we'll start the empty coinb2 with the "sequence"
@@ -296,7 +324,7 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// The bytes are the pool's, verbatim. Nothing here parses or validates
 	// them: a gateway that understood BIP300 would need rebuilding every time
 	// BIP300 gained a message, and the pool is the end that already knows.
-	for (k = 0; k < s->commitments_count; k++) {
+	for (k = 0; k < commit_count; k++) {
 		cb2idx[coinbase_index] += sprintf(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], "0000000000000000");
 		cb2idx[coinbase_index] += append_bitcoin_varint_hex(s->commitments[k].output_script_len, &s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]]);
 		for (i = 0; i < s->commitments[k].output_script_len; i++) {
@@ -802,6 +830,53 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 // coinbase.
 //
 // Returns the number of bytes they will take in the coinbase.
+// The 4-byte message tag a commitment carries, past OP_RETURN and its push.
+//
+// Every BIP300 message is OP_RETURN, one push, then a tag: d6e1c5df for an M2,
+// d77d1776 for an M4, and so on. The tag is what makes two commitments the same
+// vote rather than two different ones, which is the whole basis for letting one
+// replace the other.
+bool datum_commitment_tag(const unsigned char *script, int len, unsigned char out[4]) {
+	if (!script || len < 2 || script[0] != 0x6a) return false;
+	int i = 1;
+	const unsigned char op = script[i++];
+	if (op <= 0x4b) {
+		/* length is the opcode */
+	} else if (op == 0x4c) {
+		i += 1;
+	} else if (op == 0x4d) {
+		i += 2;
+	} else if (op == 0x4e) {
+		i += 4;
+	} else {
+		return false;
+	}
+	if (i + 4 > len) return false;
+	memcpy(out, &script[i], 4);
+	return true;
+}
+
+// Drop every commitment already held that carries this tag.
+//
+// Used when the pool sends a vote of its own: the two cannot both go in the
+// coinbase -- BIP300 allows exactly one M4 per block, and two M2s for the same
+// slot is not a thing either -- so the pool's replaces what the template
+// brought rather than joining it.
+void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[4]) {
+	int kept = 0;
+	for (int i = 0; i < s->commitments_count; i++) {
+		const int clen = s->commitments[i].output_script_len;
+		unsigned char t[4];
+		if (datum_commitment_tag(s->commitments[i].output_script, clen, t) && !memcmp(t, tag, 4)) {
+			s->commitments_size -= 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
+			continue;
+		}
+		if (kept != i) s->commitments[kept] = s->commitments[i];
+		kept++;
+	}
+	s->commitments_count = kept;
+}
+
 static int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
 	s->commitments_count = 0;
 	s->commitments_size = 0;
@@ -810,8 +885,11 @@ static int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
 	for (int i = 0; i < s->block_template->commitments_count && i < DATUM_MAX_COMMITMENTS; i++) {
 		int clen = s->block_template->commitments[i].output_script_len;
 		if (clen < 1 || clen > DATUM_MAX_COMMITMENT_SCRIPT) continue;
-		memcpy(s->commitments[i].output_script, s->block_template->commitments[i].output_script, clen);
-		s->commitments[i].output_script_len = clen;
+		// Written at commitments_count, not at i. Skipping one and still
+		// indexing by the loop counter leaves a hole holding whatever the
+		// previous job put there, and that hole is emitted as a commitment.
+		memcpy(s->commitments[s->commitments_count].output_script, s->block_template->commitments[i].output_script, clen);
+		s->commitments[s->commitments_count].output_script_len = clen;
 		// 8 bytes of value, the script's own length prefix, then the script.
 		s->commitments_size += 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
 		s->commitments_count++;
@@ -820,6 +898,33 @@ static int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
 		DLOG_DEBUG("Template carries %d commitment(s), %d bytes", s->commitments_count, s->commitments_size);
 	}
 	return s->commitments_size;
+}
+
+// How many sidechains an M4's upvote vector votes for, or -1 if it does not
+// carry one.
+//
+// The M4 body is a version byte then, for the explicit forms, one entry per
+// active sidechain: 0x01 for one-byte entries, 0x02 for two-byte. 0x00 (repeat
+// previous) and 0x03 (back the leader) carry no vector at all.
+int datum_m4_entry_count(const unsigned char *script, int len) {
+	unsigned char tag[4];
+	if (!datum_commitment_tag(script, len, tag)) return -1;
+	if (!(tag[0] == 0xd7 && tag[1] == 0x7d && tag[2] == 0x17 && tag[3] == 0x76)) return -1;
+	// Body starts after OP_RETURN, the push opcode (and its length bytes) and
+	// the tag. Only the short push forms appear here; an M4 is never large.
+	int i = 1;
+	const unsigned char op = script[i++];
+	if (op == 0x4c) i += 1;
+	else if (op == 0x4d) i += 2;
+	else if (op == 0x4e) i += 4;
+	else if (op > 0x4b) return -1;
+	i += 4; // the tag
+	if (i >= len) return -1;
+	const unsigned char version = script[i++];
+	const int body = len - i;
+	if (version == 0x01) return body;
+	if (version == 0x02) return body / 2;
+	return -1; // repeat-previous or leading-by-50: no vector to compare
 }
 
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free) {
@@ -843,6 +948,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		DLOG_WARN("Coinbaser length is invalid (too short). Using default/empty");
 		s->available_coinbase_outputs_count = 0;
 		commitments_from_template(s);
+		if (must_free) free(coinbaser);
 		return 0;
 	}
 	
@@ -865,8 +971,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		datum_id &= 0x7F;
 		if (cidx >= cblen) {
 			DLOG_ERROR("Coinbaser claims commitments but ends before the count. Using default/empty");
-			s->available_coinbase_outputs_count = 0;
-			return 0;
+			goto fail;
 		}
 		int ccount = coinbaser[cidx]; cidx++;
 		if (ccount > DATUM_MAX_COMMITMENTS) {
@@ -874,26 +979,72 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			// silently did not happen, and mining without it looks identical
 			// to mining with it.
 			DLOG_ERROR("Coinbaser has %d commitments, max %d. Using default/empty", ccount, DATUM_MAX_COMMITMENTS);
-			s->available_coinbase_outputs_count = 0;
-			return 0;
+			goto fail;
 		}
 		for (int ci = 0; ci < ccount; ci++) {
 			if (cidx + 2 > cblen) {
 				DLOG_ERROR("Coinbaser commitment %d has no length. Using default/empty", ci);
-				s->available_coinbase_outputs_count = 0;
-				return 0;
+				goto fail;
 			}
 			int clen = (int)coinbaser[cidx] | ((int)coinbaser[cidx+1] << 8); cidx += 2;
 			if (clen < 1 || clen > DATUM_MAX_COMMITMENT_SCRIPT || cidx + clen > cblen) {
 				DLOG_ERROR("Coinbaser commitment %d length (%d) is invalid. Using default/empty", ci, clen);
-				s->available_coinbase_outputs_count = 0;
-				return 0;
+				goto fail;
 			}
 			const unsigned char *cscript = &coinbaser[cidx]; cidx += clen;
-			// The bytes are walked either way -- the payout records begin
-			// after them -- but they are only kept when the template did not
-			// already supply its own.
-			if (from_template) continue;
+			// The pool's vote wins over the template's.
+			//
+			// The pool decides what it votes from its own policy and its own
+			// miners' weighted vote; a template's commitments are whatever the
+			// node building it happens to think. When both are present the
+			// pool's is the decision anyone was actually asked about, so it
+			// replaces the template's message of the same kind.
+			//
+			// Only of the same kind. A template also carries commitments the
+			// pool never sends -- an M7 answering a BMM request is the money
+			// one -- and dropping the template's whole set to make room for a
+			// vote would throw those away with it.
+			//
+			// One exception, and it is the expensive one. An M4's upvote vector
+			// has one entry per active sidechain, and a vector of the wrong
+			// length is not a smaller vote -- it is an invalid block. This pool
+			// mined one: height 996701, built on a one-entry vector where the
+			// chain wanted nine, accepted by our own node and thrown out by
+			// every peer. The subsidy, the fees and three BMM accepts went with
+			// it.
+			//
+			// So when the template brought an M4 of its own, the pool's has to
+			// agree with it about how many sidechains there are. If it does
+			// not, the template's stands. A vote not cast costs one block's
+			// worth of influence; a vote cast wrongly costs the block.
+			{
+				unsigned char tag[4];
+				if (datum_commitment_tag(cscript, clen, tag)) {
+					int mine = datum_m4_entry_count(cscript, clen);
+					int theirs = -1;
+					if (mine >= 0) {
+						for (int q = 0; q < s->commitments_count; q++) {
+							int n = datum_m4_entry_count(s->commitments[q].output_script,
+							                             s->commitments[q].output_script_len);
+							if (n >= 0) { theirs = n; break; }
+						}
+					}
+					if (mine >= 0 && theirs >= 0 && mine != theirs) {
+						DLOG_ERROR("Pool sent an M4 voting for %d sidechains where this template has %d. "
+						           "Keeping the template's: a vector of the wrong length is an invalid "
+						           "block, not a smaller vote.", mine, theirs);
+						continue;
+					}
+					datum_commitments_drop_tag(s, tag);
+				}
+			}
+			// Template commitments are already in the array, so the pool's now
+			// append to them rather than starting from empty. Bounded here for
+			// the first time because of it.
+			if (s->commitments_count >= DATUM_MAX_COMMITMENTS) {
+				DLOG_ERROR("No room for the pool's commitment beside the template's. Dropping it.");
+				continue;
+			}
 
 			// The same rule the template parser applies, applied here too.
 			//
@@ -930,7 +1081,9 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			s->commitments_count++;
 		}
 		if (from_template && ccount) {
-			DLOG_DEBUG("Ignoring %d commitment(s) from the pool: this template brought its own", ccount);
+			DLOG_DEBUG("Coinbaser carries %d commitment(s), %d bytes: %d from the pool, replacing "
+			           "the template's votes of the same kind and keeping the rest",
+			           s->commitments_count, s->commitments_size, ccount);
 		} else {
 			DLOG_DEBUG("Coinbaser carries %d commitment(s), %d bytes", s->commitments_count, s->commitments_size);
 		}
@@ -939,8 +1092,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	while (cidx < cblen) {
 		if (cidx + 8 + 1 > cblen) {
 			DLOG_ERROR("Coinbaser length is invalid (mid-parsing). Using default/empty");
-			s->available_coinbase_outputs_count = 0;
-			return 0;
+			goto fail;
 		}
 		outval = upk_u64le(coinbaser, cidx); cidx+=8;
 		if ((outval + tally) > s->coinbase_value) {
@@ -951,8 +1103,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		slen = coinbaser[cidx]; cidx++;
 		if (slen < 2 || slen > 64 || cidx + slen > cblen) {
 			DLOG_ERROR("Script length (%d) is invalid. Using default/empty", slen);
-			s->available_coinbase_outputs_count = 0;
-			return 0;
+			goto fail;
 		}
 		
 		tally += outval;
@@ -974,8 +1125,16 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	
 	s->datum_coinbaser_id = datum_id;
 	s->available_coinbase_outputs_count = cbvalid;
-	if (coinbaser && must_free) free(coinbaser);
+	if (must_free) free(coinbaser);
 	return cbvalid;
+
+	// Every malformed-coinbaser path lands here. Returning straight from the
+	// middle of the parse used to leak the buffer the caller handed us, once
+	// per bad coinbaser.
+fail:
+	s->available_coinbase_outputs_count = 0;
+	if (must_free) free(coinbaser);
+	return 0;
 }
 
 void *datum_coinbaser_thread(void *ptr) {

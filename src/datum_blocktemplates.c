@@ -131,6 +131,119 @@ void datum_template_clear(T_DATUM_TEMPLATE_DATA* p) {
 	p->txns = p->local_data;
 }
 
+// Does this transaction carry a BMM request?
+//
+// An M8 is an ordinary transaction with an OP_RETURN whose payload opens with
+// the tag 00bf00<slot> -- the one BIP300 message whose slot lives in the tag
+// rather than the body, which is why it cannot be matched from a fixed table.
+//
+// Matched on the byte pattern rather than by parsing every output, and
+// deliberately so: over-matching drops a transaction that was not a bid and
+// costs its fee, while under-matching leaves a bid in a block that cannot
+// answer it and costs the whole block. The asymmetry decides the method.
+static bool txn_is_bmm_request(const uint8_t *d, uint32_t size) {
+	if (!d || size < 8) return false;
+	for (uint32_t i = 0; i + 5 < size; i++) {
+		// OP_RETURN, a direct push, then the tag.
+		if (d[i] != 0x6a) continue;
+		if (d[i+1] == 0 || d[i+1] > 0x4b) continue;
+		if (d[i+2] == 0x00 && d[i+3] == 0xbf && d[i+4] == 0x00) return true;
+	}
+	return false;
+}
+
+// Leave the BMM bids out of a template that cannot answer them.
+//
+// A block carrying an M8 needs the M7 accept that answers it in the coinbase,
+// and only an enforcer can produce one: it chooses the transactions and the
+// coinbase together, so it knows what it is accepting. A gateway whose node
+// has no enforcer gets the bids in its template like any other transaction,
+// has nothing to accept them with, and mines a block that plain nodes take and
+// every enforcer on the network rejects -- which is how this pool lost 996794
+// at 1.3 PH/s while its own logs said the block was found.
+//
+// So the bids come out. A block with no M8 needs no M7 and is valid, which
+// costs the merged-mining fees and keeps everything else: the pool's own M2
+// and M4 votes are assertions about chain state, commit to no transaction, and
+// ride along untouched.
+//
+// Their fees go with them. The template's coinbasevalue includes the fee of
+// every transaction in it, so dropping one without subtracting its fee builds
+// a coinbase that pays more than the block earned -- invalid for a second and
+// entirely self-inflicted reason.
+//
+// Dependents go too. GBT lists a parent before its children, so one forward
+// pass closes the set transitively.
+void drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_array) {
+	if (!tdata || tdata->txn_count <= 0) return;
+
+	bool *dropped = calloc(tdata->txn_count, sizeof(bool));
+	if (!dropped) return;
+
+	int n_dropped = 0;
+	for (int i = 0; i < tdata->txn_count; i++) {
+		if (txn_is_bmm_request(tdata->txns[i].txn_data_binary, tdata->txns[i].size)) {
+			dropped[i] = true;
+			n_dropped++;
+		}
+	}
+	if (!n_dropped) { free(dropped); return; }
+
+	// Anything built on a dropped transaction cannot stand without it.
+	for (int i = 0; i < tdata->txn_count; i++) {
+		if (dropped[i]) continue;
+		json_t *tx = json_array_get(tx_array, i);
+		json_t *deps = tx ? json_object_get(tx, "depends") : NULL;
+		if (!json_is_array(deps)) continue;
+		size_t k;
+		json_t *dv;
+		json_array_foreach(deps, k, dv) {
+			// GBT depends are 1-based indices into this same list.
+			json_int_t d = json_integer_value(dv);
+			if (d >= 1 && d <= tdata->txn_count && dropped[d - 1]) {
+				dropped[i] = true;
+				n_dropped++;
+				break;
+			}
+		}
+	}
+
+	uint64_t fees_removed = 0;
+	int kept = 0;
+	for (int i = 0; i < tdata->txn_count; i++) {
+		if (dropped[i]) {
+			fees_removed          += tdata->txns[i].fee_sats;
+			tdata->txn_total_weight -= tdata->txns[i].weight;
+			tdata->txn_total_size   -= tdata->txns[i].size;
+			tdata->txn_total_sigops -= tdata->txns[i].sigops;
+			continue;
+		}
+		if (kept != i) {
+			tdata->txns[kept] = tdata->txns[i];
+		}
+		// The index the merkle branch and any later depends are read by.
+		tdata->txns[kept].index_raw = kept + 1;
+		kept++;
+	}
+	tdata->txn_count = kept;
+
+	if (fees_removed > tdata->coinbasevalue) {
+		// Cannot happen with a sane template, and if it ever does the answer
+		// is to mine nothing rather than to pay from thin air.
+		DLOG_ERROR("Dropping %d BMM bid(s) would remove %" PRIu64 " sats from a coinbase of %" PRIu64 ". Refusing this template.",
+		           n_dropped, fees_removed, tdata->coinbasevalue);
+		tdata->txn_count = 0;
+		free(dropped);
+		return;
+	}
+	tdata->coinbasevalue -= fees_removed;
+
+	DLOG_DEBUG("Left %d BMM bid(s) and their dependents out of this template: no enforcer here to accept them, "
+	           "and a bid nothing accepts is an invalid block. Coinbase reduced by %" PRIu64 " sats.",
+	           n_dropped, fees_removed);
+	free(dropped);
+}
+
 // Read a Bitcoin varint. Returns the value and advances *p, or -1 past the end.
 static int64_t gbt_varint(const unsigned char *b, size_t len, size_t *p) {
 	if (*p >= len) return -1;
@@ -572,6 +685,14 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 		}
 	}
 	
+	// A template from a plain node carries BMM bids it has no way to accept.
+	// Left in, they are an invalid block; taken out, the block is valid and
+	// merely forgoes those fees. An enforcer template is left alone: it pairs
+	// every bid with the accept that answers it.
+	if (!tdata->from_enforcer) {
+		drop_unanswerable_bmm_requests(tdata, tx_array);
+	}
+
 	// Last, because it needs both the coinbase commitments and the parsed
 	// transactions to compare them against.
 	if (!datum_template_bmm_accepts_are_backed(tdata)) return NULL;

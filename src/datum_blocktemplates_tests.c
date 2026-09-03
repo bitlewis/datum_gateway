@@ -550,7 +550,126 @@ static void a_template_with_its_own_accepts_ignores_the_pools(void) {
 	printf("  a template with none takes the pool's accept\n");
 }
 
+
+// A gateway with no enforcer leaves the BMM bids out, and keeps everything
+// else -- including the pool's votes, which is the whole point.
+//
+// This is block 996794 as a test. The pruned gateway mined a template whose
+// bids it could not accept; plain nodes took the block and every enforcer
+// rejected it, so the pool credited three miners and reversed them a minute
+// later. A bid left out costs its fee; a bid left in costs the block.
+static void a_template_without_an_enforcer_drops_the_bmm_bids(void) {
+	static T_DATUM_TEMPLATE_DATA t;
+	static T_DATUM_TEMPLATE_TXN txns[3];
+	memset(&t, 0, sizeof(t));
+	memset(txns, 0, sizeof(txns));
+
+	// An M8 bid: OP_RETURN, a push, then the 00bf00<slot> tag.
+	static unsigned char bid[64];
+	memset(bid, 0x11, sizeof(bid));
+	bid[20] = 0x6a; bid[21] = 0x24; bid[22] = 0x00; bid[23] = 0xbf; bid[24] = 0x00; bid[25] = 0x0d;
+	// An ordinary payment, and a child of the bid.
+	static unsigned char plain[64], child[64];
+	memset(plain, 0x22, sizeof(plain));
+	memset(child, 0x33, sizeof(child));
+
+	txns[0].txn_data_binary = bid;   txns[0].size = sizeof(bid);
+	txns[0].fee_sats = 1202; txns[0].weight = 400; txns[0].sigops = 1; txns[0].index_raw = 1;
+	txns[1].txn_data_binary = plain; txns[1].size = sizeof(plain);
+	txns[1].fee_sats = 5000; txns[1].weight = 600; txns[1].sigops = 2; txns[1].index_raw = 2;
+	txns[2].txn_data_binary = child; txns[2].size = sizeof(child);
+	txns[2].fee_sats = 700;  txns[2].weight = 300; txns[2].sigops = 1; txns[2].index_raw = 3;
+
+	t.txns = txns;
+	t.txn_count = 3;
+	t.coinbasevalue = 315541319;
+	t.txn_total_weight = 1300;
+	t.txn_total_size = 3 * sizeof(bid);
+	t.txn_total_sigops = 4;
+	t.from_enforcer = false;
+
+	// The third transaction depends on the first, which is the bid.
+	json_t *arr = json_array();
+	json_array_append_new(arr, json_pack("{s:[]}", "depends"));
+	json_array_append_new(arr, json_pack("{s:[]}", "depends"));
+	json_array_append_new(arr, json_pack("{s:[i]}", "depends", 1));
+
+	drop_unanswerable_bmm_requests(&t, arr);
+
+	// The bid goes, and the child that could not stand without it.
+	datum_test(t.txn_count == 1);
+	datum_test(t.txns[0].fee_sats == 5000);
+	// Renumbered, because the merkle branch and any later depends read it.
+	datum_test(t.txns[0].index_raw == 1);
+	// Both fees left the coinbase with them, or it pays more than it earned.
+	datum_test(t.coinbasevalue == 315541319 - 1202 - 700);
+	// And the tallies followed.
+	datum_test(t.txn_total_weight == 600);
+	datum_test(t.txn_total_sigops == 2);
+	printf("  a template with no enforcer drops the BMM bids, their dependents and their fees\n");
+	json_decref(arr);
+
+	// An enforcer's template is not touched by any of this: it pairs each bid
+	// with the accept that answers it, and dropping one would throw away a fee
+	// it had every right to collect.
+	memset(&t, 0, sizeof(t));
+	memset(txns, 0, sizeof(txns));
+	txns[0].txn_data_binary = bid; txns[0].size = sizeof(bid); txns[0].fee_sats = 1202;
+	t.txns = txns; t.txn_count = 1; t.coinbasevalue = 315541319; t.from_enforcer = true;
+	json_t *one = json_array();
+	json_array_append_new(one, json_pack("{s:[]}", "depends"));
+	if (!t.from_enforcer) drop_unanswerable_bmm_requests(&t, one);
+	datum_test(t.txn_count == 1);
+	datum_test(t.coinbasevalue == 315541319);
+	printf("  an enforcer's template keeps its bids\n");
+	json_decref(one);
+}
+
+
+// The same rule through the real parser, so the wiring is covered and not just
+// the function. The unit test above proves the drop works; this proves it is
+// actually reached for a template that did not come from an enforcer.
+static void the_parser_drops_bids_when_there_is_no_enforcer(void) {
+	if (!datum_test(datum_template_init() > 0)) return;
+
+	// One M8 bid and one ordinary payment, as a node would hand them over.
+	const char *bid =
+	    "020000000111111111111111111111111111111111111111111111111111111111111111110000000000"
+	    "ffffffff0100000000000000002a6a2800bf000d"
+	    "d666deb13569dd47a0c06dbc806c8e86d21f50258cc28f5e17923aa47c10852800000000";
+	const char *plain =
+	    "020000000122222222222222222222222222222222222222222222222222222222222222220000000000"
+	    "ffffffff01102700000000000016" "0014751e76e8199196d454941c45d1b3a323f1433bd6" "00000000";
+
+	char gbt[4096];
+	snprintf(gbt, sizeof(gbt),
+	    "{\"height\":996794,\"coinbasevalue\":315541319,"
+	    "\"mintime\":1788470000,\"curtime\":1788470100,\"version\":536870912,\"sigoplimit\":80000,"
+	    "\"bits\":\"1d00ffff\",\"sizelimit\":4000000,\"weightlimit\":4000000,"
+	    "\"previousblockhash\":\"0000000000000000e371b1e760aa93bcaa309f626beb59bff6c61f3e56443d48\","
+	    "\"target\":\"00000000ffff0000000000000000000000000000000000000000000000000000\","
+	    "\"default_witness_commitment\":\"6a24aa21a9ed%064x\","
+	    "\"transactions\":["
+	    "{\"txid\":\"%064x\",\"hash\":\"%064x\",\"fee\":1202,\"sigops\":1,\"weight\":400,\"depends\":[],\"data\":\"%s\"},"
+	    "{\"txid\":\"%064x\",\"hash\":\"%064x\",\"fee\":5000,\"sigops\":1,\"weight\":600,\"depends\":[],\"data\":\"%s\"}]}",
+	    2, 3, 3, bid, 4, 4, plain);
+
+	json_error_t err;
+	json_t *j = json_loads(gbt, 0, &err);
+	if (!datum_test(j != NULL)) { printf("  (fixture: %s)\n", err.text); return; }
+
+	T_DATUM_TEMPLATE_DATA *t = datum_gbt_parser(j);
+	if (!datum_test(t != NULL)) { json_decref(j); return; }
+	datum_test(!t->from_enforcer);
+	datum_test(t->txn_count == 1);
+	datum_test(t->coinbasevalue == 315541319 - 1202);
+	printf("  the parser itself drops the bids when there is no enforcer\n");
+	json_decref(j);
+}
+
 void datum_blocktemplates_tests(void) {
+	the_parser_drops_bids_when_there_is_no_enforcer();
+	a_template_without_an_enforcer_drops_the_bmm_bids();
 	a_template_with_its_own_accepts_ignores_the_pools();
 	the_output_count_matches_the_outputs_written();
 	an_m4_of_the_wrong_length_is_recognised();

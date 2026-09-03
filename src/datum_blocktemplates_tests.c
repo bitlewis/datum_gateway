@@ -476,7 +476,82 @@ static void a_skipped_template_commitment_leaves_no_hole(void) {
 	printf("  a skipped template commitment leaves no stale hole behind\n");
 }
 
+
+// A gateway with an enforcer keeps its own BMM accepts.
+//
+// The pool offers accepts so that a gateway without an enforcer can collect
+// merged-mining fees at all. A gateway that has one already holds accepts
+// chosen against the exact transaction set it is about to mine, and every
+// accept shares a tag, so letting the pool's in would drop all of those and
+// substitute somebody else's mempool view.
+static void a_template_with_its_own_accepts_ignores_the_pools(void) {
+	static T_DATUM_STRATUM_JOB job;
+	memset(&job, 0, sizeof(job));
+
+	// The template's own accept, on slot 13. Put on the template rather than
+	// straight onto the job: the parse rebuilds the job's commitments from the
+	// template every time, which is the behaviour being tested.
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&tpl, 0, sizeof(tpl));
+	unsigned char mine[39] = { 0x6a, 0x25, 0xd1, 0x61, 0x73, 0x68, 0x0d };
+	for (int i = 7; i < 39; i++) mine[i] = (unsigned char)(i * 3);
+	memcpy(tpl.commitments[0].output_script, mine, sizeof(mine));
+	tpl.commitments[0].output_script_len = sizeof(mine);
+	tpl.commitments_count = 1;
+	tpl.from_enforcer = true;
+	job.block_template = &tpl;
+	job.coinbase_value = 5000000000ULL;
+
+	// The pool sends a different accept, on slot 9.
+	unsigned char theirs[39] = { 0x6a, 0x25, 0xd1, 0x61, 0x73, 0x68, 0x09 };
+	for (int i = 7; i < 39; i++) theirs[i] = (unsigned char)(i * 7);
+
+	// A real v3 coinbaser: the datum id with the high bit set to announce a
+	// commitment section, the count, then each script behind a two-byte
+	// length. No payouts after it, which is legal and keeps this about the
+	// commitments.
+	unsigned char cb[512];
+	int n = 0;
+	cb[n++] = 0x80 | 0x01;                                             // v3 flag + datum id
+	cb[n++] = 0x01;                                                    // one commitment
+	cb[n++] = (unsigned char)sizeof(theirs); cb[n++] = 0x00;           // length, LE
+	memcpy(&cb[n], theirs, sizeof(theirs)); n += sizeof(theirs);
+
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+
+	// The template's accept stands, and the pool's was not taken.
+	datum_test(job.commitments_count == 1);
+	datum_test(job.commitments[0].output_script[6] == 0x0d);
+	printf("  a template with its own BMM accepts ignores the pool's\n");
+
+	// The same coinbaser against a template with no accepts of its own: this
+	// is the pruned node with no enforcer, and the pool's accept is the only
+	// way it collects a merged-mining fee at all. Backed by a transaction
+	// carrying the hash the accept commits to, or the check below refuses it.
+	static T_DATUM_TEMPLATE_DATA bare;
+	memset(&bare, 0, sizeof(bare));
+	// The M8 as it really appears: the accepted hash sits inside the
+	// transaction's bytes, so the check scans transaction data rather than
+	// txids. Wrapped in filler so the match is found at an offset, not at 0.
+	static T_DATUM_TEMPLATE_TXN txn;
+	static unsigned char m8_bytes[80];
+	memset(&txn, 0, sizeof(txn));
+	memset(m8_bytes, 0x11, sizeof(m8_bytes));
+	memcpy(&m8_bytes[24], &theirs[7], 32);
+	txn.txn_data_binary = m8_bytes;
+	txn.size = sizeof(m8_bytes);
+	bare.txns = &txn;
+	bare.txn_count = 1;
+	job.block_template = &bare;
+	job.commitments_count = 0;
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+	datum_test(job.commitments_count == 1);
+	datum_test(job.commitments[0].output_script[6] == 0x09);
+	printf("  a template with none takes the pool's accept\n");
+}
+
 void datum_blocktemplates_tests(void) {
+	a_template_with_its_own_accepts_ignores_the_pools();
 	the_output_count_matches_the_outputs_written();
 	an_m4_of_the_wrong_length_is_recognised();
 	the_pool_vote_replaces_the_templates_vote_of_the_same_kind();

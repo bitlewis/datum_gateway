@@ -967,6 +967,23 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	// Two-byte lengths because a payout's one byte caps at 255 and a wide M4
 	// bundle vote runs past 500.
 	bool from_template = commitments_from_template(s) > 0;
+	// How many BMM accepts this template brought of its own.
+	//
+	// A gateway whose node runs an enforcer gets its accepts in the template,
+	// chosen against the very transaction set it is about to mine. Nothing the
+	// pool can send improves on that, and the pool's were chosen against a
+	// different node's mempool, so letting them replace these would swap a
+	// certainty for a guess. Counted before the merge, because the merge is
+	// what appends the pool's to the same array.
+	int template_bmm_accepts = 0;
+	for (int q = 0; q < s->commitments_count; q++) {
+		unsigned char t[4];
+		if (datum_commitment_tag(s->commitments[q].output_script,
+		                         s->commitments[q].output_script_len, t)
+		    && t[0] == 0xd1 && t[1] == 0x61 && t[2] == 0x73 && t[3] == 0x68) {
+			template_bmm_accepts++;
+		}
+	}
 	if (datum_id & 0x80) {
 		datum_id &= 0x7F;
 		if (cidx >= cblen) {
@@ -1019,6 +1036,18 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			// worth of influence; a vote cast wrongly costs the block.
 			{
 				unsigned char tag[4];
+				if (datum_commitment_tag(cscript, clen, tag)
+				    && tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68
+				    && template_bmm_accepts > 0) {
+					// This gateway has an enforcer and has already been given
+					// the accepts that match its own block. The pool's are for
+					// somebody else's transaction set; taking them would drop
+					// these, because the merge below replaces by tag and every
+					// accept shares one.
+					DLOG_DEBUG("Ignoring a pool-sent BMM accept: this template carries %d of its own.",
+					           template_bmm_accepts);
+					continue;
+				}
 				if (datum_commitment_tag(cscript, clen, tag)) {
 					int mine = datum_m4_entry_count(cscript, clen);
 					int theirs = -1;

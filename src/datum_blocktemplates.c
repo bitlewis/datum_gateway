@@ -174,11 +174,76 @@ static bool txn_is_bmm_request(const uint8_t *d, uint32_t size) {
 //
 // Dependents go too. GBT lists a parent before its children, so one forward
 // pass closes the set transitively.
-void drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_array) {
-	if (!tdata || tdata->txn_count <= 0) return;
+
+// Recompute the coinbase's witness commitment for the transactions that remain.
+//
+// The node computes default_witness_commitment over the set it offered. Drop a
+// transaction from that set and the commitment still describes the block we are
+// no longer building, so the block is rejected as bad-witness-merkle-match --
+// which is what happened to 996,795, a block that was otherwise perfectly good.
+//
+// The commitment is the merkle root over the wtxids, the coinbase's own counted
+// as zero, hashed once more against the witness reserved value. We leave that
+// value zero, as the node does, which is why recomputing it here reproduces the
+// node's own answer byte for byte when nothing has been dropped.
+static bool recompute_witness_commitment(T_DATUM_TEMPLATE_DATA *tdata) {
+	if (!tdata->default_witness_commitment[0]) return true; // nothing committed to keep honest
+
+	const size_t n = (size_t)tdata->txn_count + 1;
+	// One leaf spare: an odd level duplicates its last entry.
+	unsigned char *tree = malloc((n + 1) * 32);
+	if (!tree) {
+		DLOG_ERROR("Out of memory recomputing the witness commitment.");
+		return false;
+	}
+	memset(tree, 0, 32); // the coinbase's wtxid is zero by definition
+	for (uint32_t i = 0; i < tdata->txn_count; i++) {
+		memcpy(tree + ((size_t)i + 1) * 32, tdata->txns[i].hash_bin, 32);
+	}
+
+	size_t count = n;
+	while (count > 1) {
+		if (count & 1) {
+			memcpy(tree + count * 32, tree + (count - 1) * 32, 32);
+			count++;
+		}
+		for (size_t j = 0; j < count / 2; j++) {
+			unsigned char pair[32];
+			if (!double_sha256(pair, tree + j * 64, 64)) {
+				free(tree);
+				return false;
+			}
+			memcpy(tree + j * 32, pair, 32);
+		}
+		count >>= 1;
+	}
+
+	unsigned char buf[64], commit[32];
+	memcpy(buf, tree, 32);
+	memset(buf + 32, 0, 32); // the witness reserved value
+	free(tree);
+	if (!double_sha256(commit, buf, 64)) return false;
+
+	static const unsigned char header[6] = { 0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed };
+	memcpy(tdata->default_witness_commitment_bin, header, sizeof(header));
+	memcpy(tdata->default_witness_commitment_bin + sizeof(header), commit, sizeof(commit));
+
+	// The coinbaser appends the hex form and reads its length for the push, so
+	// the two have to say the same thing.
+	static const char hexdigit[] = "0123456789abcdef";
+	for (int i = 0; i < 38; i++) {
+		tdata->default_witness_commitment[i * 2]     = hexdigit[tdata->default_witness_commitment_bin[i] >> 4];
+		tdata->default_witness_commitment[i * 2 + 1] = hexdigit[tdata->default_witness_commitment_bin[i] & 0x0f];
+	}
+	tdata->default_witness_commitment[76] = 0;
+	return true;
+}
+
+bool drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_array) {
+	if (!tdata || tdata->txn_count <= 0) return true;
 
 	bool *dropped = calloc(tdata->txn_count, sizeof(bool));
-	if (!dropped) return;
+	if (!dropped) return false;
 
 	int n_dropped = 0;
 	for (int i = 0; i < tdata->txn_count; i++) {
@@ -187,7 +252,8 @@ void drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_arr
 			n_dropped++;
 		}
 	}
-	if (!n_dropped) { free(dropped); return; }
+	// Nothing dropped means the node's own commitment still describes the block.
+	if (!n_dropped) { free(dropped); return true; }
 
 	// Anything built on a dropped transaction cannot stand without it.
 	for (int i = 0; i < tdata->txn_count; i++) {
@@ -232,16 +298,23 @@ void drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_arr
 		// is to mine nothing rather than to pay from thin air.
 		DLOG_ERROR("Dropping %d BMM bid(s) would remove %" PRIu64 " sats from a coinbase of %" PRIu64 ". Refusing this template.",
 		           n_dropped, fees_removed, tdata->coinbasevalue);
-		tdata->txn_count = 0;
 		free(dropped);
-		return;
+		return false;
 	}
 	tdata->coinbasevalue -= fees_removed;
+
+	free(dropped);
+
+	// The set changed, so what the coinbase says about it has to change too.
+	if (!recompute_witness_commitment(tdata)) {
+		DLOG_ERROR("Could not recompute the witness commitment after dropping %d BMM bid(s). Refusing this template.", n_dropped);
+		return false;
+	}
 
 	DLOG_DEBUG("Left %d BMM bid(s) and their dependents out of this template: no enforcer here to accept them, "
 	           "and a bid nothing accepts is an invalid block. Coinbase reduced by %" PRIu64 " sats.",
 	           n_dropped, fees_removed);
-	free(dropped);
+	return true;
 }
 
 // Read a Bitcoin varint. Returns the value and advances *p, or -1 past the end.
@@ -690,7 +763,7 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	// merely forgoes those fees. An enforcer template is left alone: it pairs
 	// every bid with the accept that answers it.
 	if (!tdata->from_enforcer) {
-		drop_unanswerable_bmm_requests(tdata, tx_array);
+		if (!drop_unanswerable_bmm_requests(tdata, tx_array)) return NULL;
 	}
 
 	// Last, because it needs both the coinbase commitments and the parsed

@@ -551,6 +551,87 @@ static void a_template_with_its_own_accepts_ignores_the_pools(void) {
 }
 
 
+// Dropping a transaction changes what the coinbase has to say about the set.
+//
+// The node's default_witness_commitment describes the transactions the node
+// offered. Take one out and keep its commitment and the block is rejected as
+// bad-witness-merkle-match -- which is what 996,795 was: a block whose bids had
+// been correctly dropped, whose merkle root was right, and whose coinbase still
+// described the template it came from.
+//
+// The expected values here come from an independent implementation of the same
+// rule, the one checked against a live node's own answer over 2,330
+// transactions. Two implementations agreeing is the only evidence available
+// without a node in the test.
+static void dropping_a_bid_rewrites_the_witness_commitment(void) {
+	static T_DATUM_TEMPLATE_DATA t;
+	static T_DATUM_TEMPLATE_TXN txns[3];
+	static unsigned char bid[64], plain[64], other[64];
+	memset(bid, 0x11, sizeof(bid));
+	bid[20] = 0x6a; bid[21] = 0x24; bid[22] = 0x00; bid[23] = 0xbf; bid[24] = 0x00; bid[25] = 0x0d;
+	memset(plain, 0x22, sizeof(plain));
+	memset(other, 0x33, sizeof(other));
+
+	// The commitment the node handed us, describing all three.
+	static const char *stale = "6a24aa21a9ed9ccbde7801c3e3e8e11da5764ffa18ea6b55b3da136c4ee890e352bff9087ef0";
+
+	struct { int keep; const char *want; } cases[] = {
+		// One transaction left: an even level, hashed straight to the root.
+		{ 1, "6a24aa21a9eda997fefd9694e5b6fec7a500b38e64562b5698e1a4c51b0595371ff6f17ab214" },
+		// Two left, so three leaves with the coinbase: an odd level, whose last
+		// entry is duplicated to pair it.
+		{ 2, "6a24aa21a9edc56f03bfdb3d4b720e1f5593ecc94b0bebedff8df1cdd812870bb450fcc0028a" },
+	};
+
+	for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+		memset(&t, 0, sizeof(t));
+		memset(txns, 0, sizeof(txns));
+		// The bid first, then as many ordinary transactions as this case keeps.
+		txns[0].txn_data_binary = bid;   txns[0].size = sizeof(bid);   txns[0].fee_sats = 1202;
+		txns[1].txn_data_binary = plain; txns[1].size = sizeof(plain); txns[1].fee_sats = 5000;
+		txns[2].txn_data_binary = other; txns[2].size = sizeof(other); txns[2].fee_sats = 700;
+		memset(txns[1].hash_bin, 0x22, 32);
+		memset(txns[2].hash_bin, 0x33, 32);
+		t.txns = txns;
+		t.txn_count = 1 + cases[c].keep;
+		t.coinbasevalue = 315541319;
+		t.from_enforcer = false;
+		strcpy(t.default_witness_commitment, stale);
+
+		json_t *arr = json_array();
+		for (uint32_t i = 0; i < t.txn_count; i++) {
+			json_array_append_new(arr, json_pack("{s:[]}", "depends"));
+		}
+		datum_test(drop_unanswerable_bmm_requests(&t, arr));
+		json_decref(arr);
+
+		datum_test(t.txn_count == (uint32_t)cases[c].keep);
+		if (!datum_test(!strcmp(t.default_witness_commitment, cases[c].want))) {
+			printf("    got  %s\n    want %s\n", t.default_witness_commitment, cases[c].want);
+		}
+		// The binary form is what the parser derived from the hex, and the two
+		// have to keep agreeing.
+		datum_test(t.default_witness_commitment_bin[0] == 0x6a);
+		datum_test(t.default_witness_commitment_bin[5] == 0xed);
+	}
+	printf("  dropping a bid rewrites the witness commitment over what is left\n");
+
+	// Nothing dropped, nothing rewritten: the node's own commitment already
+	// describes the block, and recomputing it would only risk disagreeing.
+	memset(&t, 0, sizeof(t));
+	memset(txns, 0, sizeof(txns));
+	txns[0].txn_data_binary = plain; txns[0].size = sizeof(plain);
+	t.txns = txns; t.txn_count = 1; t.coinbasevalue = 315541319; t.from_enforcer = false;
+	strcpy(t.default_witness_commitment, stale);
+	json_t *none = json_array();
+	json_array_append_new(none, json_pack("{s:[]}", "depends"));
+	datum_test(drop_unanswerable_bmm_requests(&t, none));
+	datum_test(!strcmp(t.default_witness_commitment, stale));
+	json_decref(none);
+	printf("  a template that lost nothing keeps the node's commitment\n");
+}
+
+
 // A gateway with no enforcer leaves the BMM bids out, and keeps everything
 // else -- including the pool's votes, which is the whole point.
 //
@@ -670,6 +751,7 @@ static void the_parser_drops_bids_when_there_is_no_enforcer(void) {
 void datum_blocktemplates_tests(void) {
 	the_parser_drops_bids_when_there_is_no_enforcer();
 	a_template_without_an_enforcer_drops_the_bmm_bids();
+	dropping_a_bid_rewrites_the_witness_commitment();
 	a_template_with_its_own_accepts_ignores_the_pools();
 	the_output_count_matches_the_outputs_written();
 	an_m4_of_the_wrong_length_is_recognised();

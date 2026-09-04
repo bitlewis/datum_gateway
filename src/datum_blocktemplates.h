@@ -236,7 +236,8 @@ bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata);
 // a bid nothing accepts is an invalid block, so on a template that did not
 // come from an enforcer they are dropped along with their dependents and their
 // fees. Exposed for the tests.
-void drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_array);
+// Returns false when the template cannot be made safe to mine.
+bool drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_array);
 
 bool datum_template_commitment_is_backed(const unsigned char *scr, int slen,
                                          const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count);

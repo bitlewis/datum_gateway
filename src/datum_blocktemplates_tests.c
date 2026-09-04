@@ -551,6 +551,76 @@ static void a_template_with_its_own_accepts_ignores_the_pools(void) {
 }
 
 
+// A pool acking two proposals gets two M2s into the block.
+//
+// Every M2 carries the same tag, and the merge cleared by tag once per
+// incoming message: the second ack deleted the first, so a pool backing two
+// sidechains showed two ACKs in its own interface and mined one. Both of
+// epool's proposals -- RISCy on slot 3 and Snowside on slot 88 -- were
+// standing ACK, and block 996,812 went out acking only Snowside.
+//
+// The M4 beside them still replaces the template's, because there really is
+// only one M4 in a block. That is the difference the fix turns on: a tag is
+// cleared once for the whole merge, not once per message carrying it.
+static void the_pool_can_ack_more_than_one_proposal(void) {
+	static T_DATUM_STRATUM_JOB job;
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+
+	// The template brings an M4 of its own, which the pool's must replace.
+	unsigned char m4_template[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x00 };
+	memcpy(tpl.commitments[0].output_script, m4_template, sizeof(m4_template));
+	tpl.commitments[0].output_script_len = sizeof(m4_template);
+	tpl.commitments_count = 1;
+	job.block_template = &tpl;
+	job.coinbase_value = 5000000000ULL;
+
+	// Two acks that differ only in the proposal hash inside them, and the
+	// pool's own M4.
+	unsigned char m2_a[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf };
+	unsigned char m2_b[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf };
+	for (int i = 6; i < 39; i++) { m2_a[i] = (unsigned char)(i * 3); m2_b[i] = (unsigned char)(i * 5); }
+	unsigned char m4_pool[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x03 };
+
+	unsigned char cb[512];
+	int n = 0;
+	cb[n++] = 0x80 | 0x01;
+	cb[n++] = 0x03; // two acks and a vote
+	cb[n++] = (unsigned char)sizeof(m2_a); cb[n++] = 0x00;
+	memcpy(&cb[n], m2_a, sizeof(m2_a)); n += sizeof(m2_a);
+	cb[n++] = (unsigned char)sizeof(m2_b); cb[n++] = 0x00;
+	memcpy(&cb[n], m2_b, sizeof(m2_b)); n += sizeof(m2_b);
+	cb[n++] = (unsigned char)sizeof(m4_pool); cb[n++] = 0x00;
+	memcpy(&cb[n], m4_pool, sizeof(m4_pool)); n += sizeof(m4_pool);
+
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+
+	int acks = 0, votes = 0;
+	bool saw_a = false, saw_b = false;
+	for (int i = 0; i < job.commitments_count; i++) {
+		unsigned char tag[4];
+		if (!datum_commitment_tag(job.commitments[i].output_script,
+		                          job.commitments[i].output_script_len, tag)) continue;
+		if (!memcmp(tag, "\xd6\xe1\xc5\xdf", 4)) {
+			acks++;
+			if (!memcmp(job.commitments[i].output_script, m2_a, sizeof(m2_a))) saw_a = true;
+			if (!memcmp(job.commitments[i].output_script, m2_b, sizeof(m2_b))) saw_b = true;
+		}
+		if (!memcmp(tag, "\xd7\x7d\x17\x76", 4)) {
+			votes++;
+			// The pool's, not the template's: version 0x03, not 0x00.
+			datum_test(job.commitments[i].output_script[6] == 0x03);
+		}
+	}
+	if (!datum_test(acks == 2)) printf("    kept %d ack(s), want 2\n", acks);
+	datum_test(saw_a && saw_b);
+	// Exactly one M4, and the template's is the one that went.
+	datum_test(votes == 1);
+	printf("  two acked proposals both reach the coinbase, beside a single vote\n");
+}
+
+
 // Dropping a transaction changes what the coinbase has to say about the set.
 //
 // The node's default_witness_commitment describes the transactions the node
@@ -752,6 +822,7 @@ void datum_blocktemplates_tests(void) {
 	the_parser_drops_bids_when_there_is_no_enforcer();
 	a_template_without_an_enforcer_drops_the_bmm_bids();
 	dropping_a_bid_rewrites_the_witness_commitment();
+	the_pool_can_ack_more_than_one_proposal();
 	a_template_with_its_own_accepts_ignores_the_pools();
 	the_output_count_matches_the_outputs_written();
 	an_m4_of_the_wrong_length_is_recognised();

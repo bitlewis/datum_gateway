@@ -858,10 +858,15 @@ bool datum_commitment_tag(const unsigned char *script, int len, unsigned char ou
 
 // Drop every commitment already held that carries this tag.
 //
-// Used when the pool sends a vote of its own: the two cannot both go in the
-// coinbase -- BIP300 allows exactly one M4 per block, and two M2s for the same
-// slot is not a thing either -- so the pool's replaces what the template
-// brought rather than joining it.
+// Used when the pool sends a message of its own, so the pool's replaces what
+// the template brought rather than joining it.
+//
+// Called once per tag for a whole merge, never once per commitment. A tag is
+// not a message: every M2 carries the same one, and a pool acking two
+// proposals sends two M2s that differ only in the slot and hash inside them.
+// Calling this for each of them in turn had the second delete the first, and
+// the pool acked two sidechains in its own interface while every block it
+// found carried an ack for one.
 void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[4]) {
 	int kept = 0;
 	for (int i = 0; i < s->commitments_count; i++) {
@@ -998,6 +1003,10 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			DLOG_ERROR("Coinbaser has %d commitments, max %d. Using default/empty", ccount, DATUM_MAX_COMMITMENTS);
 			goto fail;
 		}
+		// The tags whose template commitments this merge has already cleared.
+		// See datum_commitments_drop_tag: clearing is per tag, not per message.
+		unsigned char cleared[DATUM_MAX_COMMITMENTS][4];
+		int cleared_count = 0;
 		for (int ci = 0; ci < ccount; ci++) {
 			if (cidx + 2 > cblen) {
 				DLOG_ERROR("Coinbaser commitment %d has no length. Using default/empty", ci);
@@ -1064,7 +1073,16 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 						           "block, not a smaller vote.", mine, theirs);
 						continue;
 					}
-					datum_commitments_drop_tag(s, tag);
+					bool cleared_already = false;
+					for (int q = 0; q < cleared_count; q++) {
+						if (!memcmp(cleared[q], tag, 4)) { cleared_already = true; break; }
+					}
+					if (!cleared_already) {
+						datum_commitments_drop_tag(s, tag);
+						if (cleared_count < DATUM_MAX_COMMITMENTS) {
+							memcpy(cleared[cleared_count++], tag, 4);
+						}
+					}
 				}
 			}
 			// Template commitments are already in the array, so the pool's now

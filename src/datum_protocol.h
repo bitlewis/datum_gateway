@@ -46,12 +46,12 @@
 // Works out to over 5 minutes of jobs at 30-40 second work change intervals. No miner should be holding on to work this long.
 #define MAX_DATUM_PROTOCOL_JOBS 8
 
-// Sent to the server as a UA. The +bip300 suffix is how a pool learns this
+// Sent to the server as a UA. The +drivechains suffix is how a pool learns this
 // gateway can carry BIP300/301 coinbase commitments: a pool seeing it may send
 // the v3 coinbaser, and a pool not seeing it sends the old format rather than
 // something this parser would reject -- which would cost the gateway its
 // payout list, not merely its votes.
-#define DATUM_PROTOCOL_VERSION "v0.4.4-rc+drivechains"
+#define DATUM_PROTOCOL_VERSION "v0.4.5-rc+drivechains"
 #define DATUM_PROTOCOL_CONNECT_TIMEOUT 30
 
 #define DATUM_PROTOCOL_MAX_CMD_DATA_SIZE 4194304 // 2^22 - protocol limit!

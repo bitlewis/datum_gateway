@@ -183,6 +183,11 @@ int main(const int argc, const char * const * const argv) {
 		exit(1);
 	}
 	datum_print_banner();
+	// Said at INFO, and early, because a deploy that lands somewhere the unit
+	// does not run from is otherwise invisible: the file on disk is new, the
+	// service restarts, and the old binary keeps mining. The log should be able
+	// to answer which build is actually running without anyone guessing.
+	DLOG_INFO("Running datum_gateway " DATUM_PROTOCOL_VERSION);
 	
 	if (datum_read_config(arguments.config_file) != 1) {
 		DLOG_FATAL("Error reading config file. Check --help");

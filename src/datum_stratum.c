@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -1523,8 +1524,29 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 		json_t *pw = json_array_get(params_obj, 1);
 		const char *pw_s = pw ? json_string_value(pw) : NULL;
 		if (pw_s && pw_s[0]) {
-			if ((pw_s[0] == 'd' || pw_s[0] == 'D') && pw_s[1] == '=') {
-				datum_stratum_set_diff_floor(c, pw_s + 2);
+			// Directives, not a secret: "d=NNNN" for a difficulty floor and
+			// "cb=TYPE" for a coinbase type, separated by commas when both are
+			// given. A rig's operator knows what their firmware can carry
+			// better than a fingerprint does, in either direction.
+			bool directive = ((pw_s[0] == 'd' || pw_s[0] == 'D') && pw_s[1] == '=') ||
+			                 ((pw_s[0] == 'c' || pw_s[0] == 'C') && (pw_s[1] == 'b' || pw_s[1] == 'B') && pw_s[2] == '=');
+			if (directive) {
+				char buf[256];
+				strncpy(buf, pw_s, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+				char *save = NULL;
+				for (char *tok = strtok_r(buf, ", ;", &save); tok; tok = strtok_r(NULL, ", ;", &save)) {
+					if ((tok[0] == 'd' || tok[0] == 'D') && tok[1] == '=') {
+						datum_stratum_set_diff_floor(c, tok + 2);
+					} else if ((tok[0] == 'c' || tok[0] == 'C') && (tok[1] == 'b' || tok[1] == 'B') && tok[2] == '=') {
+						int t = datum_stratum_coinbase_type_by_name(tok + 3);
+						if (t > 0) {
+							m->coinbase_selection = t;
+							DLOG_INFO("client %s chose coinbase type %d from its password", m->useragent, t);
+						} else {
+							DLOG_WARN("client %s asked for coinbase type \"%s\", which is not one; keeping %d", m->useragent, tok + 3, m->coinbase_selection);
+						}
+					}
+				}
 			} else if (!m->worker_auth_sent) {
 				m->worker_auth_sent = true;
 				datum_protocol_send_worker_auth(username_s, pw_s);
@@ -1725,8 +1747,62 @@ int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c) {
 	return 0;
 }
 
+// The coinbase types by the names the dashboard uses, and by number. -1 if the
+// name is nobody's.
+int datum_stratum_coinbase_type_by_name(const char *s) {
+	static const char *names[] = { "blank", "tiny", "default", "respect", "yuge", "antmain2" };
+	if (!s || !s[0]) return -1;
+	if (s[1] == 0 && s[0] >= '1' && s[0] <= '5') return s[0] - '0';
+	for (int i = 1; i < 6; i++) {
+		if (!strcasecmp(s, names[i])) return i;
+	}
+	return -1;
+}
+
+// The operator's own rules, from stratum.coinbase_types. First match wins.
+// "prefix=type" matches the start of the user agent, "*text=type" matches
+// anywhere in it. A rule that does not parse is skipped with a log line
+// rather than refused: a typo in one rule should not take the others down.
+int datum_stratum_coinbase_type_from_rules(const char *ua) {
+	if (!ua || !ua[0]) return -1;
+	for (int i = 0; i < DATUM_CONFIG_MAX_ARRAY_ENTRIES && datum_config.stratum_v1_coinbase_types[i][0]; i++) {
+		const char *rule = datum_config.stratum_v1_coinbase_types[i];
+		const char *eq = strrchr(rule, '=');
+		if (!eq || eq == rule) { DLOG_WARN("stratum.coinbase_types rule \"%s\" has no =type", rule); continue; }
+		int t = datum_stratum_coinbase_type_by_name(eq + 1);
+		if (t < 1) { DLOG_WARN("stratum.coinbase_types rule \"%s\" names no coinbase type", rule); continue; }
+		size_t n = (size_t)(eq - rule);
+		char pat[DATUM_MAX_SUBMIT_URL_LEN];
+		if (n >= sizeof(pat)) continue;
+		memcpy(pat, rule, n); pat[n] = 0;
+		if (pat[0] == '*') {
+			if (pat[1] && strstr(ua, pat + 1)) return t;
+		} else if (strncmp(ua, pat, n) == 0) {
+			return t;
+		}
+	}
+	return -1;
+}
+
 void datum_stratum_fingerprint_by_UA(T_DATUM_MINER_DATA *m) {
-	// TODO: Make this a little more efficient. perhaps move to a loadable definitions file of some kind.
+	// The operator's rules first: they know their fleet, and a rule is how a
+	// tested result reaches a running gateway without a rebuild.
+	{
+		int t = datum_stratum_coinbase_type_from_rules(m->useragent);
+		if (t > 0) { m->coinbase_selection = t; return; }
+	}
+	
+	// NerdQAxe and NerdOctaxe: ESP-Miner forks. Their firmware copies the
+	// coinbase halves with strdup, assembles the transaction at its actual
+	// length and hashes it from the heap, so the only ceiling is the 16 KB
+	// stratum line buffer. A 2,250-byte coinbase makes a 7 KB notify; the
+	// 6.5 KB type would run within a few hundred bytes of that buffer on a
+	// block with many transactions, so it is not given on paper.
+	// UA starts with: NerdQAxe or NerdOCTAXE
+	if (strstr(m->useragent, "NerdQAxe") == m->useragent || strstr(m->useragent, "NerdOCTAXE") == m->useragent) {
+		m->coinbase_selection = 5; // ANTMAIN2
+		return;
+	}
 	
 	// S21 tested to handle 2.25KB coinbase work on all versions released
 	// UA starts with: Antminer S21/
@@ -1829,6 +1905,11 @@ int client_mining_subscribe(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 			m->current_diff = datum_config.stratum_v1_vardiff_min;
 		}
 	}
+	// Said once per connection, at a level that is kept: which coinbase a rig
+	// is on decides how many payouts and commitments its blocks can carry, and
+	// a new firmware mapping is verified by watching this line and the shares
+	// that follow it.
+	DLOG_INFO("client \"%s\" gets coinbase type %d", m->useragent, m->coinbase_selection);
 	
 	// get a new unique session ID for this connection (extranonce1)
 	sid = get_new_session_id(c);

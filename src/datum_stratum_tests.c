@@ -38,6 +38,7 @@
 
 #include "datum_jsonrpc.h"
 #include "datum_stratum.h"
+#include "datum_conf.h"
 #include "datum_utils.h"
 
 void datum_stratum_mod_username_tests() {
@@ -178,6 +179,29 @@ void datum_stratum_mod_username_tests() {
 	datum_test(0 == strcmp(res, "def.ghi"));
 }
 
+static void coinbase_types_by_name_and_rule(void) {
+	datum_test(datum_stratum_coinbase_type_by_name("antmain2") == 5);
+	datum_test(datum_stratum_coinbase_type_by_name("Respect") == 3);
+	datum_test(datum_stratum_coinbase_type_by_name("3") == 3);
+	datum_test(datum_stratum_coinbase_type_by_name("blank") == -1); // not a type a miner may pick
+	datum_test(datum_stratum_coinbase_type_by_name("9") == -1);
+	datum_test(datum_stratum_coinbase_type_by_name("") == -1);
+	
+	memset(datum_config.stratum_v1_coinbase_types, 0, sizeof(datum_config.stratum_v1_coinbase_types));
+	strcpy(datum_config.stratum_v1_coinbase_types[0], "NerdQAxe=antmain2");
+	strcpy(datum_config.stratum_v1_coinbase_types[1], "broken rule");
+	strcpy(datum_config.stratum_v1_coinbase_types[2], "*bosminer=respect");
+	strcpy(datum_config.stratum_v1_coinbase_types[3], "Antminer S19=nosuch");
+	datum_test(datum_stratum_coinbase_type_from_rules("NerdQAxe TPS546/BM1370/v1.1.0") == 5);
+	datum_test(datum_stratum_coinbase_type_from_rules("bosminer-plus-tuner 2.0") == 3);
+	datum_test(datum_stratum_coinbase_type_from_rules("Antminer S19/1.0") == -1);
+	datum_test(datum_stratum_coinbase_type_from_rules("whatsminer/v1") == -1);
+	datum_test(datum_stratum_coinbase_type_from_rules("") == -1);
+	memset(datum_config.stratum_v1_coinbase_types, 0, sizeof(datum_config.stratum_v1_coinbase_types));
+	printf("  coinbase types resolve by name, and operator rules match by prefix or substring\n");
+}
+
 void datum_stratum_tests(void) {
+	coinbase_types_by_name_and_rule();
 	datum_stratum_mod_username_tests();
 }

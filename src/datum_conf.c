@@ -105,6 +105,8 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 		.required = false, .ptr = &datum_config.stratum_v1_share_stale_seconds, 		.default_int = 120 },
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "stratum", 		.name = "fingerprint_miners",		.description = "Attempt to fingerprint miners for better use of coinbase space",
 		.required = false, .ptr = &datum_config.stratum_v1_fingerprint_miners, 			.default_bool = true },
+	{ .var_type = DATUM_CONF_STRING_ARRAY, 	.category = "stratum", 		.name = "coinbase_types",			.description = "Rules mapping a miner user agent to a coinbase type, checked before the built-in fingerprints. \"prefix=type\" matches the start of the UA, \"*text=type\" matches anywhere. Types: tiny (500 B), default (755), antmain2 (2250), respect (6500), yuge (16000). Example: [\"NerdQAxe=antmain2\", \"*bosminer=respect\"]",
+		.required = false, .ptr = datum_config.stratum_v1_coinbase_types[0],		.max_string_len = sizeof(*datum_config.stratum_v1_coinbase_types) },
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "idle_timeout_no_subscribe",.description = "Seconds we allow a connection to be idle without seeing a work subscription? (0 disables)",
 		.required = false, .ptr = &datum_config.stratum_v1_idle_timeout_no_subscribe, 	.default_int = 15 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "idle_timeout_no_shares",	.description = "Seconds we allow a subscribed connection to be idle without seeing at least one accepted share? (0 disables)",

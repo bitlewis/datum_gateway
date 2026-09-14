@@ -118,6 +118,10 @@ typedef struct {
 	int stratum_v1_vardiff_quickdiff_delta;
 	int stratum_v1_share_stale_seconds;
 	bool stratum_v1_fingerprint_miners;
+	// Operator rules mapping a user agent to a coinbase type: "prefix=type" or
+	// "*substring=type". Checked before the built-in fingerprints. Same
+	// storage stride as every string array, which the parser assumes.
+	char stratum_v1_coinbase_types[DATUM_CONFIG_MAX_ARRAY_ENTRIES][DATUM_MAX_SUBMIT_URL_LEN];
 	int stratum_v1_idle_timeout_no_subscribe;
 	int stratum_v1_idle_timeout_no_share;
 	int stratum_v1_idle_timeout_max_last_work;

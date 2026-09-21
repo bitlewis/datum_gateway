@@ -201,7 +201,33 @@ static void coinbase_types_by_name_and_rule(void) {
 	printf("  coinbase types resolve by name, and operator rules match by prefix or substring\n");
 }
 
+// A coinbase that dropped the commitments is fine for votes and fatal for a
+// BMM accept: the request it answers is a transaction in the same block.
+static void a_dropped_bmm_accept_makes_a_coinbase_unservable(void) {
+	T_DATUM_STRATUM_JOB j;
+	memset(&j, 0, sizeof(j));
+	j.commitments_count = 3;
+
+	// Votes only: a type that could not fit them abstains, which is legal.
+	j.has_bmm_accept = false;
+	j.coinbase[1].carries_commitments = false;
+	j.coinbase[4].carries_commitments = true;
+	datum_test(datum_job_coinbase_is_safe(&j, 1));
+	datum_test(datum_job_coinbase_is_safe(&j, 4));
+
+	// One of them is an accept: only a type that carries the whole set may be
+	// served, and coinbase 0 never carries one.
+	j.has_bmm_accept = true;
+	datum_test(!datum_job_coinbase_is_safe(&j, 1));
+	datum_test(datum_job_coinbase_is_safe(&j, 4));
+	datum_test(!datum_job_coinbase_is_safe(&j, 0));
+	datum_test(!datum_job_coinbase_is_safe(&j, MAX_COINBASE_TYPES));
+	datum_test(!datum_job_coinbase_is_safe(NULL, 1));
+	printf("  a coinbase that dropped a BMM accept is not served\n");
+}
+
 void datum_stratum_tests(void) {
 	coinbase_types_by_name_and_rule();
+	a_dropped_bmm_accept_makes_a_coinbase_unservable();
 	datum_stratum_mod_username_tests();
 }

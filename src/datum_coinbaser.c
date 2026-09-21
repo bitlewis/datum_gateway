@@ -213,11 +213,15 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// abstains, which is legal, rather than one larger than it said it could
 	// carry, which it will not mine at all.
 	int commit_count = 0, commit_size = 0;
+	// Assume the worst until the budget says otherwise: a type that drops the
+	// set is one this job must not be mined on when an accept is among them.
+	s->coinbase[coinbase_index].carries_commitments = (s->commitments_count == 0);
 	if (s->commitments_count > 0) {
 		if (s->commitments_size <= remaining_size &&
 		    (s->commitments_size * 2) + 1024 <= STRATUM_COINBASE2_MAX_LEN) {
 			commit_count = s->commitments_count;
 			commit_size = s->commitments_size;
+			s->coinbase[coinbase_index].carries_commitments = true;
 		} else {
 			// Once per change, not once per job: a job is built every few
 			// seconds and this condition can hold for a whole template.
@@ -556,6 +560,15 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 }
 
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only) {
+	// Settled here because this is where every coinbase type is rebuilt, which
+	// is after the coinbaser has landed and the commitment set is whatever it
+	// is going to be for this job.
+	//
+	// Coinbase 0 is the plain one -- pool output and witness commitment, no
+	// commitment section -- so it is marked as carrying nothing before the
+	// sized types below decide for themselves.
+	datum_job_note_bmm_accept(s);
+	s->coinbase[0].carries_commitments = (s->commitments_count == 0);
 	// Account for available vsize, sigops, size, weight, etc
 	
 	// Note:
@@ -836,6 +849,34 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 // d77d1776 for an M4, and so on. The tag is what makes two commitments the same
 // vote rather than two different ones, which is the whole basis for letting one
 // replace the other.
+// Whether the job's commitment set contains a BMM accept, and therefore
+// whether dropping the set changes a valid block into an invalid one.
+void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
+	unsigned char tag[4];
+	s->has_bmm_accept = false;
+	for (int i = 0; i < s->commitments_count; i++) {
+		if (datum_commitment_tag(s->commitments[i].output_script, s->commitments[i].output_script_len, tag)
+		    && tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68) {
+			s->has_bmm_accept = true;
+			return;
+		}
+	}
+}
+
+// Whether a client on this coinbase type may be served this job.
+//
+// A coinbase that dropped the commitments for want of room is fine when they
+// are only votes: not voting is legal. It is not fine when one of them is a
+// BMM accept, because the request it answers is a transaction in this job's
+// block, and a block carrying the request without the accept is one the
+// enforcer rejects while the node and the gateway both call it a success.
+// Block 969,898 was lost exactly that way.
+bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect) {
+	if (!j || cbselect < 0 || cbselect >= MAX_COINBASE_TYPES) return false;
+	if (!j->has_bmm_accept) return true;
+	return j->coinbase[cbselect].carries_commitments;
+}
+
 bool datum_commitment_tag(const unsigned char *script, int len, unsigned char out[4]) {
 	if (!script || len < 2 || script[0] != 0x6a) return false;
 	int i = 1;

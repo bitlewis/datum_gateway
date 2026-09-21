@@ -1664,6 +1664,27 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 		}
 	}
 	
+	// The one thing this gateway must never hand out: work whose coinbase had
+	// no room for a BMM accept, on a block that carries the request it
+	// answers. The node takes such a block, every enforcer rejects it, and the
+	// pool is told it found one -- which is how 969,898 was lost.
+	//
+	// The answer is the empty job the gateway already builds for the first
+	// seconds of a new block: no transactions, so no request to answer. It
+	// costs this client the block's fees and it cannot cost anyone the block.
+	// Only a client whose firmware takes a coinbase too small for the set is
+	// ever sent there, and only while the set is that large.
+	if (!new_block && !datum_job_coinbase_is_safe(j, cbselect)) {
+		static uint64_t warned_job[MAX_COINBASE_TYPES];
+		if (warned_job[cbselect] != j->global_index) {
+			warned_job[cbselect] = j->global_index;
+			DLOG_WARN("Coinbase type %d cannot carry this job's %d commitment(s) including a BMM accept; "
+			          "serving empty work to clients on that type rather than a block the enforcer would reject.",
+			          cbselect, j->commitments_count);
+		}
+		new_block = true;
+	}
+	
 	cb = &j->coinbase[cbselect];
 	// new block work always is just a blank coinbase, for now
 	

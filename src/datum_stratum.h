@@ -110,6 +110,10 @@ typedef struct {
 	
 	int coinb1_len;
 	int coinb2_len;
+	// Whether this coinbase carries the job's whole commitment set. False
+	// when the set did not fit the type's budget, which is safe for votes
+	// and fatal for a BMM accept: the block still holds the request.
+	bool carries_commitments;
 } T_DATUM_STRATUM_COINBASE;
 
 typedef struct {
@@ -152,6 +156,11 @@ typedef struct {
 	T_DATUM_TXN_COMMITMENT commitments[DATUM_MAX_COMMITMENTS];
 	int commitments_count;
 	int commitments_size; // bytes they consume in the coinbase, including headers
+	// Whether any of them is a BMM accept (M7). An accept answers a request
+	// that is in this job's block, so a coinbase without it mines a block
+	// every enforcer rejects -- which is how a pool loses a block and is told
+	// nothing is wrong. See datum_job_coinbase_is_safe.
+	bool has_bmm_accept;
 	unsigned char pool_addr_script[64];
 	int pool_addr_script_len;
 	
@@ -281,6 +290,7 @@ const char *datum_stratum_mod_username(const char *username_s, char *username_bu
 int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool new_block);
 void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, int job_state);
 void stratum_job_merkle_root_calc(T_DATUM_STRATUM_JOB *s, unsigned char *coinbase_txn_hash, unsigned char *merkle_root_output);
+bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect);
 int datum_stratum_coinbase_type_by_name(const char *s);
 int datum_stratum_coinbase_type_from_rules(const char *ua);
 int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t coinbase_txn_size, T_DATUM_STRATUM_JOB *job, T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const char *block_hash_hex, bool empty_work);

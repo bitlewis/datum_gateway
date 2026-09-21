@@ -818,7 +818,69 @@ static void the_parser_drops_bids_when_there_is_no_enforcer(void) {
 	json_decref(j);
 }
 
+
+// Bitcoin Cash II turned SegWit off: its templates have no witness commitment
+// and do not list the rule. Such a template parses, and the coinbase built from
+// it declares exactly the outputs it carries, with no commitment among them.
+static void a_chain_without_segwit_gets_a_coinbase_without_the_commitment(void) {
+	if (!datum_test(datum_template_init() > 0)) return;
+	const char *fmt =
+	    "{\"height\":82182,\"coinbasevalue\":5000000000,\"rules\":[%s],"
+	    "\"mintime\":1790032394,\"curtime\":1790033442,\"version\":536870912,\"sigoplimit\":640000,"
+	    "\"bits\":\"19015d12\",\"sizelimit\":32000000,\"weightlimit\":32000000,"
+	    "\"previousblockhash\":\"00000000000000017763f0d61fc6c8fc433537a54cfb3f2d09a5273d35a080e8\","
+	    "\"target\":\"00000000000000015d1200000000000000000000000000000000000000000000\","
+	    "\"transactions\":[]}";
+	char gbt[2048];
+	json_error_t err;
+
+	snprintf(gbt, sizeof(gbt), fmt, "\"csv\"");
+	json_t *j = json_loads(gbt, 0, &err);
+	if (!datum_test(j != NULL)) { printf("  (fixture: %s)\n", err.text); return; }
+	T_DATUM_TEMPLATE_DATA *t = datum_gbt_parser(j);
+	datum_test(t != NULL && t->default_witness_commitment[0] == 0);
+	json_decref(j);
+
+	// A chain that does enforce SegWit still has to send the commitment.
+	snprintf(gbt, sizeof(gbt), fmt, "\"csv\",\"!segwit\"");
+	j = json_loads(gbt, 0, &err);
+	if (!datum_test(j != NULL)) return;
+	datum_test(datum_gbt_parser(j) == NULL);
+	json_decref(j);
+	printf("  a template without SegWit parses; one with it still needs the commitment\n");
+
+	static T_DATUM_STRATUM_JOB job;
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+	job.block_template = &tpl;
+	job.coinbase_value = 50ULL * 100000000ULL;
+	job.pool_addr_script_len = 25;
+	job.pool_addr_script[0] = 0x76; job.pool_addr_script[1] = 0xa9; job.pool_addr_script[2] = 0x14;
+	for (int k = 0; k < 60; k++) {
+		job.available_coinbase_outputs[k].output_script_len = 25;
+		job.available_coinbase_outputs[k].output_script[0] = 0x76;
+		job.available_coinbase_outputs[k].output_script[1] = 0xa9;
+		job.available_coinbase_outputs[k].output_script[2] = 0x14;
+		job.available_coinbase_outputs[k].value_sats = 10000000ULL;
+	}
+	job.available_coinbase_outputs_count = 60;
+	int mismatches = 0;
+	for (int budget = 200; budget <= 2600; budget++) {
+		int cb1idx[MAX_COINBASE_TYPES] = { 0 }, cb2idx[MAX_COINBASE_TYPES] = { 0 };
+		job.coinbase[1].coinb2[0] = 0;
+		generate_coinbase_txns_for_stratum_job_subtypebysize(&job, 1, budget, true, cb1idx, cb2idx, false);
+		int declared = -1, trailing = -1;
+		int actual = coinb2_outputs(job.coinbase[1].coinb2, &declared, &trailing);
+		if (actual != declared || trailing != 4) mismatches++;
+		datum_test(strstr(job.coinbase[1].coinb2, "6a24aa21a9ed") == NULL);
+	}
+	datum_test(mismatches == 0);
+	printf("  and its coinbase declares exactly the outputs it carries (%d mismatched)\n", mismatches);
+}
+
 void datum_blocktemplates_tests(void) {
+	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();
 	a_template_without_an_enforcer_drops_the_bmm_bids();
 	dropping_a_bid_rewrites_the_witness_commitment();

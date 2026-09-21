@@ -58,6 +58,15 @@ CURL *coinbaser_curl = NULL;
 
 const char *cbstart_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff"; // 82 len hex, 41 bytes
 
+// The witness commitment output, when there is one. A chain that turned SegWit
+// off (Bitcoin Cash II) sends a template without one, and its blocks carry no
+// such output: the coinbase is one output shorter throughout.
+void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s);
+
+static inline int witness_outputs(const T_DATUM_STRATUM_JOB *s) {
+	return s->block_template->default_witness_commitment[0] ? 1 : 0;
+}
+
 #define MAX_COINBASE_TAG_SPACE 86 // leaves space for BIP34 height, extranonces, datum prime tag, etc.
 
 int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
@@ -268,12 +277,12 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 
 	if (space_for_en_in_coinbase) {
 		// we'll start the empty coinb2 with the "sequence"
-		m+=2; // pool addr + witness
+		m += 1 + witness_outputs(s); // pool addr + witness
 		pk_u64le(s->coinbase[coinbase_index].coinb2, cb2idx[coinbase_index], 0x6666666666666666ULL);  // "ffffffff"
 		cb2idx[coinbase_index] = 8;
 		cb2idx[coinbase_index] += append_bitcoin_varint_hex(m, &s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]]); // us, witness, and "m" outputs
 	} else {
-		m+=3;
+		m += 2 + witness_outputs(s);
 		cb1idx[coinbase_index] += append_bitcoin_varint_hex(m, &s->coinbase[coinbase_index].coinb1[cb1idx[coinbase_index]]); // extranonce, us, witness commit, and "m" outputs
 		
 		if (!special_coinb1) {
@@ -366,7 +375,7 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	
 	// witness commit output costs 46 bytes
 	// append the default_witness_commitment
-	cb2idx[coinbase_index] += sprintf(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
+	if (witness_outputs(s)) cb2idx[coinbase_index] += sprintf(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
 	// lock time
 	cb2idx[coinbase_index] += sprintf(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], "00000000");
 }
@@ -469,7 +478,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		// we'll start the empty coinb2 with the "sequence"
 		pk_u64le(s->coinbase[0].coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
 		cb2idx[0] = 8;
-		cb2idx[0] += append_bitcoin_varint_hex(2, &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
+		cb2idx[0] += append_bitcoin_varint_hex(1 + witness_outputs(s), &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
 		
 		if (new_block) {
 			// copy the beginning to the subsidy-only
@@ -482,7 +491,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		if (new_block) {
 			j = cb1idx[0];
 		}
-		cb1idx[0] += append_bitcoin_varint_hex(3, &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
+		cb1idx[0] += append_bitcoin_varint_hex(2 + witness_outputs(s), &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
 		
 		// append extranonce op_return
 		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "0000000000000000106a0e%04" PRIx16, s->enprefix);
@@ -514,7 +523,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	
 	// witness commit output costs 46 bytes
 	// append the default_witness_commitment
-	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
+	if (witness_outputs(s)) cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
 	// lock time
 	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
 	
@@ -684,7 +693,7 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		// we'll start the empty coinb2 with the "sequence"
 		pk_u64le(s->coinbase[0].coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
 		cb2idx[0] = 8;
-		cb2idx[0] += append_bitcoin_varint_hex(2, &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
+		cb2idx[0] += append_bitcoin_varint_hex(1 + witness_outputs(s), &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
 		
 		if (empty_only) {
 			// copy the beginning to the subsidy-only
@@ -697,7 +706,7 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		if (empty_only) {
 			j = cb1idx[0];
 		}
-		cb1idx[0] += append_bitcoin_varint_hex(3, &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
+		cb1idx[0] += append_bitcoin_varint_hex(2 + witness_outputs(s), &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
 		
 		// append extranonce op_return
 		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "0000000000000000106a0e%04" PRIx16, s->enprefix);
@@ -729,7 +738,7 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	
 	// witness commit output costs 46 bytes
 	// append the default_witness_commitment
-	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
+	if (witness_outputs(s)) cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
 	// lock time
 	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
 	

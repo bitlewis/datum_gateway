@@ -523,6 +523,22 @@ bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata) {
 	return true;
 }
 
+// Whether the template's rules name the rule, with or without the "!" that
+// marks one the client must understand.
+static bool gbt_rules_include(json_t *gbt, const char *rule) {
+	json_t *rules = json_object_get(gbt, "rules");
+	size_t i;
+	json_t *r;
+	if (!json_is_array(rules)) return false;
+	json_array_foreach(rules, i, r) {
+		const char *v = json_string_value(r);
+		if (!v) continue;
+		if (v[0] == '!') v++;
+		if (!strcmp(v, rule)) return true;
+	}
+	return false;
+}
+
 T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	T_DATUM_TEMPLATE_DATA *tdata;
 	const char *s;
@@ -631,13 +647,19 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	s = json_string_value(jval);
 	strcpy(tdata->block_target_hex, s);
 	
+	// A chain enforcing SegWit lists it among the template's rules and must
+	// send the commitment. One that turned it off (Bitcoin Cash II) sends
+	// neither, and its coinbase goes without the output.
 	jval = json_object_get(gbt, "default_witness_commitment");
-	if (json_string_length(jval) < 38 || json_string_length(jval) > 95) {
+	if (jval == NULL && !gbt_rules_include(gbt, "segwit")) {
+		tdata->default_witness_commitment[0] = 0;
+	} else if (json_string_length(jval) < 38 || json_string_length(jval) > 95) {
 		DLOG_ERROR("Missing data from GBT JSON (default_witness_commitment)");
 		return NULL;
+	} else {
+		s = json_string_value(jval);
+		strcpy(tdata->default_witness_commitment, s);
 	}
-	s = json_string_value(jval);
-	strcpy(tdata->default_witness_commitment, s);
 	
 	// "20000000", "192e17d5", "66256be5"
 	// version, bits, time

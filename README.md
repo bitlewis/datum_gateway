@@ -14,7 +14,66 @@ Currently the DATUM Gateway supports communication with mining hardware using th
 
 **Using Bitcoin Knots is highly recommended**. This gives miners fine controls over how they wish to construct their block templates.  Other node implementations that support GBT can also be used.  This includes Bitcoin Core, but it is severely lacking in template control options.  That is unfortunately a centralizing force which partly defeats the purpose of decentralizing block template creation in the first place.
 
-The DATUM Gateway only supports mining Bitcoin.  Modifying the code to support non-Bitcoin is not straightforward, as many optimizations and design considerations are tightly tied to Bitcoin-specific restraints for efficiency.
+The DATUM Gateway only supports mining Bitcoin.  Modifying the code to support non-Bitcoin is not straightforward, as many optimizations and design considerations are tightly tied to Bitcoin-specific restraints for efficiency.  (This fork also mines eCash and Bitcoin Cash II, both Bitcoin-derived SHA-256 chains; see [About this fork](#about-this-fork).)
+
+## About this fork
+
+This is BlockFab's fork of OCEAN's DATUM Gateway, currently **v0.5.3-rc+drivechains**. It is the gateway behind the pools at [blockfab.org](https://blockfab.org) and [epool.cash](https://epool.cash). Everything upstream does still works as described below; this section lists what the fork adds and changes. The design notes for the drivechain work are in [doc/bip300-integration.md](doc/bip300-integration.md).
+
+A gateway built from this fork mines with a pool that runs stock DATUM too. The extra messages it sends are ones an upstream pool ignores, and it only asks for the extended payout format when the pool offers it.
+
+### One codebase, three chains
+
+The same build mines all of these, deciding from what the node's block template contains rather than from a coin setting:
+
+| Chain | Node | What the gateway does |
+|---|---|---|
+| Bitcoin | Knots or Core | Exactly what upstream does. |
+| eCash (BIP300/301 drivechains) | eCash node, optionally behind a [bip300301_enforcer](https://github.com/LayerTwo-Labs/bip300301_enforcer) | Carries the pool's sidechain votes and merged-mining commitments in the coinbase (see below). |
+| Bitcoin Cash II (SegWit off) | BitcoincashII node | Builds blocks without a witness commitment. |
+
+**Chains without SegWit.** A template that neither lists the `segwit` rule nor carries `default_witness_commitment` is accepted, and every coinbase built from it has one output fewer: no commitment output, and no witness data. A template that does list `segwit` must still carry the commitment, so nothing changes on Bitcoin or eCash. Stock DATUM refuses every such template, so it cannot mine Bitcoin Cash II.
+
+### Drivechains (BIP300/301)
+
+- **Coinbase commitments from the pool.** The pool sends BIP300 governance messages (M2 sidechain acks, M4 bundle acks) and BIP301 accepts (M7) along with the payout list, in an extended coinbaser format with two-byte lengths, so wide M4 votes fit. The gateway places them without interpreting them, so a new BIP300 message needs no gateway change. Their size is taken from the coinbase budget before any payout, and a set that does not fit is left out whole rather than cut short. A cut-short set would be a partial vote, or a vote that silently did not happen.
+- **Several acks per block.** Every M2 carries the same tag. The merge now replaces the template's messages once per tag rather than once per message, so a pool acking two proposals puts both acks in the block.
+- **Templates from an enforcer.** Point `bitcoind.rpcurl` at a bip300301_enforcer and the gateway takes the enforcer's coinbase value and commitments, then builds the coinbase from the pool's payout list as DATUM always does. The enforcer's own payout output is discarded. Every RPC is sent as JSON-RPC 2.0, which the enforcer requires.
+- **Merged-mining safety.** A BMM accept (M7) answers a request (M8) that is an ordinary transaction in the same block. A block with an accept but no matching request is accepted by plain nodes and rejected by every enforcer, so the gateway guards against producing one:
+  - an accept whose request is not in the block is refused, whether it came from the template or from the pool;
+  - on a template that did not come from an enforcer, BMM bids are dropped along with their fees and dependents, and the witness commitment is recomputed over what is left;
+  - a gateway whose own template already carries accepts keeps them rather than taking the pool's;
+  - a miner whose coinbase type is too small to carry an accept gets empty work (no transactions, so no request to answer) until one fits;
+  - a template over 16,383 transactions is refused rather than truncated, because truncation can drop a request while keeping its accept.
+- **preciousblock follows the block.** The tie-break is sent to the node the block was actually submitted to. An enforcer does not implement preciousblock, so list your node in `extra_block_submissions` to keep it.
+- The user agent carries `+drivechains`, which is how a pool knows it may send the extended format.
+
+### The stratum password
+
+The password field now does three things. Several settings can be combined with commas, for example `d=65536,cb=respect`.
+
+- **`d=NNNN`: a difficulty floor.** Vardiff may still raise the rig above it, so a mistyped value cannot flood the pool with shares. It is rounded down to a power of two.
+- **`cb=TYPE`: a coinbase type**, for a rig whose firmware can carry more (or less) than its fingerprint suggests. The types are `tiny` (500 B), `default` (755 B), `antmain2` (2,250 B), `respect` (6,500 B) and `yuge` (16,000 B), or their numbers 1–5.
+- **Anything else is forwarded to the pool** once per connection (DATUM sub-command `0x30`), padded like every other message. A pool that keeps accounts stores it hashed, as proof that the address is yours. This matters for miners who pay to an exchange and hold no key to sign with. A password that is a `d=` or `cb=` setting is never forwarded, an empty one sends nothing, and an over-long one is dropped rather than truncated.
+
+### Coinbase types by user agent
+
+`stratum.coinbase_types` maps a miner's user agent to a coinbase type without a rebuild. These rules are checked before the built-in fingerprints, and the first match wins. `prefix=type` matches the start of the user agent, and `*text=type` matches anywhere in it:
+
+```json
+"stratum": {
+  "coinbase_types": ["NerdQAxe=antmain2", "*bosminer=respect"]
+}
+```
+
+NerdQAxe and NerdOctaxe (ESP-Miner forks) are now recognised and given the 2,250-byte type. The gateway logs one line per subscribe saying which type each client gets.
+
+### Robustness
+
+- The coinbase always declares exactly the number of outputs it writes, at every budget; a test sweeps the budgets to check this.
+- While the pool restarts, miners that redial are no longer refused.
+- The gateway logs its version and commit at startup, so you can check which build is actually running.
+- `./datum_gateway --test` runs the gateway's own checks, including the drivechain and no-SegWit cases.
 
 ## DATUM Protocol
 The DATUM Gateway's communication with the mining pool is via the DATUM Protocol.  This is an encrypted communication link between the DATUM Gateway (client) and DATUM Prime (pool side).

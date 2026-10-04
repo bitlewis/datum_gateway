@@ -141,7 +141,7 @@ void datum_template_clear(T_DATUM_TEMPLATE_DATA* p) {
 // deliberately so: over-matching drops a transaction that was not a bid and
 // costs its fee, while under-matching leaves a bid in a block that cannot
 // answer it and costs the whole block. The asymmetry decides the method.
-static bool txn_is_bmm_request(const uint8_t *d, uint32_t size) {
+bool txn_is_bmm_request(const uint8_t *d, uint32_t size) {
 	if (!d || size < 8) return false;
 	for (uint32_t i = 0; i + 5 < size; i++) {
 		// OP_RETURN, a direct push, then the tag.

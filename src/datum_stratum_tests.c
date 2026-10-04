@@ -223,6 +223,16 @@ static void a_dropped_bmm_accept_makes_a_coinbase_unservable(void) {
 	datum_test(!datum_job_coinbase_is_safe(&j, 0));
 	datum_test(!datum_job_coinbase_is_safe(&j, MAX_COINBASE_TYPES));
 	datum_test(!datum_job_coinbase_is_safe(NULL, 1));
+
+	// A bid in the block with no accept in the job: no coinbase type can save
+	// it, not even one with room, so none is served.
+	j.has_bmm_accept = false;
+	j.has_bmm_request = true;
+	for (int cb = 0; cb < MAX_COINBASE_TYPES; cb++) datum_test(!datum_job_coinbase_is_safe(&j, cb));
+	// With the accept loaded, the types that carry it are fine again.
+	j.has_bmm_accept = true;
+	datum_test(datum_job_coinbase_is_safe(&j, 4));
+	datum_test(!datum_job_coinbase_is_safe(&j, 1));
 	printf("  a coinbase that dropped a BMM accept is not served\n");
 }
 

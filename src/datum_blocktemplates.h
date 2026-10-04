@@ -238,6 +238,8 @@ bool datum_template_bmm_accepts_are_backed(T_DATUM_TEMPLATE_DATA *tdata);
 // fees. Exposed for the tests.
 // Returns false when the template cannot be made safe to mine.
 bool drop_unanswerable_bmm_requests(T_DATUM_TEMPLATE_DATA *tdata, json_t *tx_array);
+// Whether a serialized transaction carries a BMM request (M8 bid).
+bool txn_is_bmm_request(const uint8_t *d, uint32_t size);
 
 bool datum_template_commitment_is_backed(const unsigned char *scr, int slen,
                                          const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count);

@@ -611,7 +611,13 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		// No pool
 		s->pool_addr_script_len = addr_2_output_script(datum_config.mining_pool_address, &s->pool_addr_script[0], 64);
 		s->is_datum_job = false;
-		empty_only = true;
+		// Solo, the plain coinbase pays everything to our address, so every
+		// type can be a copy of it -- unless the template brought commitments.
+		// The plain coinbase has no room for them, and a copy of it would
+		// leave a BMM accept out of a block that carries its bid. Build the
+		// sized types then: with no payouts, they pay our address and carry
+		// the commitments.
+		empty_only = (s->commitments_count == 0);
 	}
 	if (!s->pool_addr_script_len) {
 		DLOG_FATAL("Could not generate output script for pool addr! Perhaps invalid? This is bad.");
@@ -863,6 +869,15 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
 	unsigned char tag[4];
 	s->has_bmm_accept = false;
+	s->has_bmm_request = false;
+	if (s->block_template) {
+		for (uint32_t t = 0; t < s->block_template->txn_count; t++) {
+			if (txn_is_bmm_request(s->block_template->txns[t].txn_data_binary, s->block_template->txns[t].size)) {
+				s->has_bmm_request = true;
+				break;
+			}
+		}
+	}
 	for (int i = 0; i < s->commitments_count; i++) {
 		if (datum_commitment_tag(s->commitments[i].output_script, s->commitments[i].output_script_len, tag)
 		    && tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68) {
@@ -882,6 +897,9 @@ void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
 // Block 969,898 was lost exactly that way.
 bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect) {
 	if (!j || cbselect < 0 || cbselect >= MAX_COINBASE_TYPES) return false;
+	// A bid in the block and no accept in the job: whatever coinbase is
+	// built, the block is invalid on the drivechain. Only empty work is safe.
+	if (j->has_bmm_request && !j->has_bmm_accept) return false;
 	if (!j->has_bmm_accept) return true;
 	return j->coinbase[cbselect].carries_commitments;
 }
@@ -1265,7 +1283,13 @@ void *datum_coinbaser_thread(void *ptr) {
 			if (datum_protocol_is_active()) {
 				i = datum_protocol_coinbaser_fetch(s);
 			} else {
+				// No pool: nothing to pay but our own address. The template's
+				// commitments still have to go in -- a node that serves a
+				// coinbasetxn (an enforcer, or a Chains node) left its BMM bids
+				// in the block, and each needs the accept the template carries.
+				// Without this, solo blocks kept the bid and lost the accept.
 				s->available_coinbase_outputs_count = 0;
+				commitments_from_template(s);
 				i = 0;
 			}
 			if (i>=0) {

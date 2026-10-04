@@ -161,6 +161,10 @@ typedef struct {
 	// every enforcer rejects -- which is how a pool loses a block and is told
 	// nothing is wrong. See datum_job_coinbase_is_safe.
 	bool has_bmm_accept;
+	// Whether this job's block carries a BMM request (M8 bid). A bid with no
+	// accept beside it is the same lost block from the other side: the
+	// accept was never loaded, so no coinbase type can carry it.
+	bool has_bmm_request;
 	unsigned char pool_addr_script[64];
 	int pool_addr_script_len;
 	

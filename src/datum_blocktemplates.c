@@ -152,6 +152,66 @@ bool txn_is_bmm_request(const uint8_t *d, uint32_t size) {
 	return false;
 }
 
+// Read one compact-size integer at *p, advancing past it. False when it runs
+// past the end.
+static bool txn_varint(const uint8_t *d, uint32_t size, uint32_t *p, uint64_t *out) {
+	if (*p >= size) return false;
+	const uint8_t b = d[*p];
+	const int w = (b < 0xfd) ? 0 : (b == 0xfd ? 2 : (b == 0xfe ? 4 : 8));
+	if ((uint64_t)*p + 1 + w > size) return false;
+	uint64_t v = b;
+	if (w) {
+		v = 0;
+		for (int k = 0; k < w; k++) v |= (uint64_t)d[*p + 1 + k] << (8 * k);
+	}
+	*p += 1 + w;
+	*out = v;
+	return true;
+}
+
+// Does one of this transaction's outputs carry a BMM request?
+//
+// The exact question, read from the outputs, which is where BIP301 puts a bid.
+// The byte scan above answers it loosely, which suits dropping a bid -- a false
+// match costs one fee -- but not refusing work. A job whose block holds a bid
+// and no accept is served empty (datum_job_coinbase_is_safe), so a false match
+// there costs every fee in the block for as long as the transaction waits. And
+// the scan does match inside hashes: on eCash one transaction in 3.8 million,
+// d28dea71... in block 970,991, spends a coin whose txid ends 6a2100bf ahead of
+// output index 0, which reads as OP_RETURN, a push, and the tag.
+//
+// A transaction this cannot read falls back to the scan, which has never missed
+// a bid. A template's transactions are always readable, so that is a guard.
+bool txn_has_bmm_request_output(const uint8_t *d, uint32_t size) {
+	uint32_t p = 4; // version
+	uint64_t n, len;
+	if (!d || size < 10) return txn_is_bmm_request(d, size);
+	// Witness serialization: a zero where the input count would be, then a one.
+	if (d[4] == 0x00 && d[5] == 0x01) p = 6;
+	if (!txn_varint(d, size, &p, &n)) goto unreadable;
+	for (uint64_t i = 0; i < n; i++) {
+		if ((uint64_t)p + 36 > size) goto unreadable;
+		p += 36; // the output being spent
+		if (!txn_varint(d, size, &p, &len) || (uint64_t)p + len + 4 > size) goto unreadable;
+		p += (uint32_t)len + 4; // its script, then the sequence
+	}
+	if (!txn_varint(d, size, &p, &n)) goto unreadable;
+	for (uint64_t i = 0; i < n; i++) {
+		if ((uint64_t)p + 8 > size) goto unreadable;
+		p += 8; // value
+		if (!txn_varint(d, size, &p, &len) || (uint64_t)p + len > size) goto unreadable;
+		const uint8_t *s = &d[p];
+		// OP_RETURN, a direct push, then 00bf00<slot>: the same shape the scan
+		// looks for, at the start of a script rather than anywhere.
+		if (len >= 5 && s[0] == 0x6a && s[1] >= 1 && s[1] <= 0x4b &&
+		    s[2] == 0x00 && s[3] == 0xbf && s[4] == 0x00) return true;
+		p += (uint32_t)len;
+	}
+	return false;
+unreadable:
+	return txn_is_bmm_request(d, size);
+}
+
 // Leave the BMM bids out of a template that cannot answer them.
 //
 // A block carrying an M8 needs the M7 accept that answers it in the coinbase,

@@ -872,7 +872,9 @@ void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
 	s->has_bmm_request = false;
 	if (s->block_template) {
 		for (uint32_t t = 0; t < s->block_template->txn_count; t++) {
-			if (txn_is_bmm_request(s->block_template->txns[t].txn_data_binary, s->block_template->txns[t].size)) {
+			// Exactly, not by the byte scan: a false match here empties the
+			// job. See txn_has_bmm_request_output.
+			if (txn_has_bmm_request_output(s->block_template->txns[t].txn_data_binary, s->block_template->txns[t].size)) {
 				s->has_bmm_request = true;
 				break;
 			}

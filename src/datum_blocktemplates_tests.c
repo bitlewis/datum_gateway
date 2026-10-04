@@ -879,6 +879,50 @@ static void a_chain_without_segwit_gets_a_coinbase_without_the_commitment(void) 
 	printf("  and its coinbase declares exactly the outputs it carries (%d mismatched)\n", mismatches);
 }
 
+// Both from eCash. The first is an ordinary payment whose input spends a coin
+// with a txid ending 6a2100bf ahead of output index 0 -- the byte scan reads
+// that as a bid. The second is a real one (08136d63... in block 971,000).
+static void unhex_into(const char *hex, uint8_t *out, uint32_t *n) {
+	*n = strlen(hex) >> 1;
+	for (uint32_t i = 0; i < *n; i++) out[i] = hex2bin_uchar(&hex[i * 2]);
+}
+
+static void a_bid_is_read_from_the_outputs_not_from_a_hash(void) {
+	static const char *not_a_bid =
+		"02000000000101f718311c0ff7e20c15c2f0e85a0bdf6936c2872ce767f22398e1dcd26a"
+		"2100bf0000000000ffffffff03f40f01000000000016001497d546467169baa1b12b05ca"
+		"045cdaebb5228a7a18010000000000000451024e730000000000000000156a5d12140114"
+		"00ff7f818cec82d08bc0a88281d2150247304402205f74e53f686216a563a1fd9bd23304"
+		"e84e4457f0da023e71c916014ea40bd126022001c482fab3c82c69dce4942e5fd39bde2d"
+		"2784efcf7d2f571867c2d5cab4b65b01210214b6accd4877428d51737c6ac7210ff7d613"
+		"29edb7ccced799e9821e962a837c00000000";
+	static const char *a_bid =
+		"02000000000101cb7ab3678477b0fdc9372c7a12e7428bea8d9a2d418aa88bddb80fdeef"
+		"009de40100000000fdffffff020000000000000000466a4400bf0082fedcdb4f7faa173e"
+		"dcbec8d48ebc2c5cddff1122faf5e4728f2fc7edca33c6b8136e0def59b58d5796566013"
+		"0e65fde22edb567237d1cc1d0000000000000000c22a1006000000001600141e797f234d"
+		"6c9b0022e4c7eb6624c8ab23710ad90247304402202eb2a2b635f97e11898c8b92044891"
+		"df34d94d935b96cd836c653ba3046d9d4702201ec070c31af523f362701f154b000b415c"
+		"a20178835ea0c201190c6a7e85cded01210226c83fee09f0ef66958348d3d4d76bd701c4"
+		"7bcd8741a437ab1c26fd1ac53d1500000000";
+	uint8_t b[512];
+	uint32_t n;
+
+	unhex_into(not_a_bid, b, &n);
+	datum_test(txn_is_bmm_request(b, n));           // the scan is fooled
+	datum_test(!txn_has_bmm_request_output(b, n));  // the outputs are not
+
+	unhex_into(a_bid, b, &n);
+	datum_test(txn_is_bmm_request(b, n));
+	datum_test(txn_has_bmm_request_output(b, n));
+
+	// Cut short, it cannot be read, and the scan answers instead -- which for
+	// these bytes still finds the bid.
+	datum_test(txn_has_bmm_request_output(b, 120) == txn_is_bmm_request(b, 120));
+	datum_test(txn_has_bmm_request_output(b, 120));
+	printf("  a bid is read from the outputs, not from a hash that looks like one\n");
+}
+
 void datum_blocktemplates_tests(void) {
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();
@@ -899,4 +943,5 @@ void datum_blocktemplates_tests(void) {
 	a_pool_sent_accept_is_checked_against_our_own_block();
 	commitments_without_bmm_are_left_alone();
 	a_real_enforcer_coinbase();
+	a_bid_is_read_from_the_outputs_not_from_a_hash();
 }

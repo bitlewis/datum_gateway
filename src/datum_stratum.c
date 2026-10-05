@@ -2263,6 +2263,7 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	// commitments (and with them the accept), a job whose block has a request must not be served
 	// as a block (see datum_job_coinbase_is_safe), however long the coinbaser takes, or if it fails.
 	s->commitments_count = 0;
+	datum_job_note_bmm_request(s);
 	datum_job_note_bmm_accept(s);
 	
 	// prep the coinbase txn(s) for this job

@@ -59,8 +59,15 @@
 // carries up to two bytes per sidechain across 256 slots, so ~517 bytes is
 // reachable and a 64-byte cap would silently drop exactly the votes that
 // matter once governance is busy.
-#define DATUM_MAX_COMMITMENTS 24
-#define DATUM_MAX_COMMITMENT_SCRIPT 560
+//
+// Room for a sidechain proposal (M1) too: a title of up to 255 bytes and a
+// description of up to 1024, about 1,350 bytes in all. A template whose
+// messages do not fit is still mined: what does not fit is left out (see
+// parse_coinbasetxn), never the template.
+#define DATUM_MAX_COMMITMENTS 64
+#define DATUM_MAX_COMMITMENT_SCRIPT 1400
+// Most sidechains a Chains node reports votes for (its slots).
+#define DATUM_MAX_VOTABLE 256
 
 typedef struct {
 	unsigned char output_script[DATUM_MAX_COMMITMENT_SCRIPT];
@@ -208,6 +215,16 @@ typedef struct {
 	// commitment we derive ourselves.
 	T_DATUM_TXN_COMMITMENT commitments[DATUM_MAX_COMMITMENTS];
 	int		commitments_count;
+	// A BMM accept of the template that did not fit. Its request is in the
+	// block, so a coinbase without it makes an invalid block: such a job is
+	// served empty work (see datum_job_note_bmm_accept).
+	bool		bmm_accepts_dropped;
+	// From Chains' drivechain_votable: per active sidechain, in vote order,
+	// the bundles pending. What a vote (M4) the pool sends is checked
+	// against; without it, the pool's vote is not carried.
+	bool		votable_known;
+	int		votable_count;
+	uint16_t	votable_bundles[DATUM_MAX_VOTABLE];
 	// Set when the template arrived in coinbasetxn mode. Distinct from having
 	// commitments: an enforcer with nothing to vote on this block sends none,
 	// and its transaction ordering still must not be disturbed.

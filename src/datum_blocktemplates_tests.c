@@ -38,6 +38,8 @@
 
 // Build a coinbase transaction hex from a list of (value, scriptPubKey) pairs.
 // Segwit-serialised with a single input, which is what a template server sends.
+static void unhex_into(const char *hex, uint8_t *out, uint32_t *n);
+
 static void cb_hex(char *out, size_t outsz, int nout, const uint64_t *vals, const char **spks) {
 	char *p = out;
 	size_t left = outsz;
@@ -49,7 +51,13 @@ static void cb_hex(char *out, size_t outsz, int nout, const uint64_t *vals, cons
 	for (int i = 0; i < nout; i++) {
 		uint64_t v = vals[i];
 		for (int b = 0; b < 8; b++) { n = snprintf(p, left, "%02x", (unsigned)((v >> (8*b)) & 0xff)); p += n; left -= n; }
-		n = snprintf(p, left, "%02x%s", (unsigned)(strlen(spks[i])/2), spks[i]); p += n; left -= n;
+		const unsigned sl = (unsigned)(strlen(spks[i])/2);
+		if (sl < 0xfd) {
+			n = snprintf(p, left, "%02x%s", sl, spks[i]);
+		} else {
+			n = snprintf(p, left, "fd%02x%02x%s", sl & 0xff, sl >> 8, spks[i]);
+		}
+		p += n; left -= n;
 	}
 	snprintf(p, left, "00000000");
 }
@@ -108,19 +116,100 @@ static void a_truncated_coinbase_is_refused(void) {
 	printf("  a truncated coinbase is refused\n");
 }
 
-static void too_many_commitments_is_refused_not_truncated(void) {
+static void too_many_commitments_leaves_the_rest_out(void) {
+	// Refusing the template left every miner on stale work for as long as the
+	// node kept putting the message in. What does not fit is left out; if that
+	// is a BMM accept, the job is marked, and is served empty work.
 	T_DATUM_TEMPLATE_DATA t = { 0 };
 	int n = DATUM_MAX_COMMITMENTS + 2;
 	uint64_t *vals = calloc(n, sizeof(uint64_t));
 	const char **spks = calloc(n, sizeof(char *));
 	vals[0] = 312500000ULL; spks[0] = SPK_PAY;
 	for (int i = 1; i < n; i++) { vals[i] = 0; spks[i] = SPK_M4; }
-	char *hex = malloc(65536);
-	cb_hex(hex, 65536, n, vals, spks);
-	// Keeping the first N would be a vote that silently did not happen.
-	datum_test(!datum_template_parse_coinbasetxn(&t, hex));
+	char *hex = malloc(200000);
+	cb_hex(hex, 200000, n, vals, spks);
+	datum_test(datum_template_parse_coinbasetxn(&t, hex));
+	datum_test(t.commitments_count == DATUM_MAX_COMMITMENTS);
+	datum_test(!t.bmm_accepts_dropped);
+	spks[n - 1] = SPK_M7;
+	cb_hex(hex, 200000, n, vals, spks);
+	datum_test(datum_template_parse_coinbasetxn(&t, hex));
+	datum_test(t.bmm_accepts_dropped);
 	free(hex); free(vals); free(spks);
-	printf("  more commitments than we can carry is refused, not truncated\n");
+	printf("  what does not fit is left out, and a left out accept makes the job empty work\n");
+}
+
+static void a_proposal_fits(void) {
+	// A sidechain proposal (M1) with the longest title and description.
+	T_DATUM_TEMPLATE_DATA t = { 0 };
+	static char m1[2 * 1360 + 1];
+	int k = 0;
+	// OP_RETURN OP_PUSHDATA2 <len LE>, then the tag, the slot and the description.
+	const int body = 4 + 1 + 1 + 1 + 255 + 1024 + 32 + 32;
+	k += sprintf(&m1[k], "6a4d%02x%02x" "d5e0c4af" "02" "00" "ff", body & 0xff, body >> 8);
+	for (int i = 0; i < 255 + 1024 + 64; i++) k += sprintf(&m1[k], "41");
+	uint64_t vals[2] = { 312500000ULL, 0 };
+	const char *spks[2] = { SPK_PAY, m1 };
+	char *hex = malloc(8192);
+	cb_hex(hex, 8192, 2, vals, spks);
+	datum_test(datum_template_parse_coinbasetxn(&t, hex));
+	datum_test(t.commitments_count == 1);
+	free(hex);
+	printf("  the longest sidechain proposal is carried\n");
+}
+
+static void only_what_chains_reads_as_a_bid_is_one(void) {
+	// A transaction anyone can send, with an output that looks like a bid but is
+	// not one to Chains, which therefore puts no accept in the block: taking it
+	// for a bid made every job empty work, for free.
+	uint8_t b[512];
+	uint32_t n;
+	char hex[1024];
+	char body[2 * 65 + 1];
+	for (int i = 0; i < 65; i++) sprintf(&body[2 * i], "%02x", i);
+	// One input, two outputs: a payment, then 6a44 00bf00 ... as output 1.
+	snprintf(hex, sizeof(hex), "02000000" "01" "%064x" "00000000" "00" "ffffffff" "02"
+	         "1027000000000000" "16" "0014" "0102030405060708090a0b0c0d0e0f1011121314"
+	         "0000000000000000" "46" "6a44" "00bf00" "%s" "00000000", 0, body);
+	unhex_into(hex, b, &n);
+	datum_test(!txn_has_bmm_request_output(b, n));
+	// The shape as output 0, but a short push.
+	snprintf(hex, sizeof(hex), "02000000" "01" "%064x" "00000000" "00" "ffffffff" "01"
+	         "0000000000000000" "07" "6a05" "00bf000000" "00000000", 0);
+	unhex_into(hex, b, &n);
+	datum_test(!txn_has_bmm_request_output(b, n));
+	// The real thing.
+	snprintf(hex, sizeof(hex), "02000000" "01" "%064x" "00000000" "00" "ffffffff" "01"
+	         "0000000000000000" "46" "6a44" "00bf00" "%s" "00000000", 0, body);
+	unhex_into(hex, b, &n);
+	datum_test(txn_has_bmm_request_output(b, n));
+	printf("  only output 0 with the exact shape is a bid\n");
+}
+
+static void a_pool_vote_has_to_fit_the_template(void) {
+	T_DATUM_TEMPLATE_DATA t = { 0 };
+	const unsigned char one_byte[] = { 0x6a, 0x07, 0xd7, 0x7d, 0x17, 0x76, 0x01, 0x00, 0xff };
+	const unsigned char follow[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x03 };
+	// Without the node's word on the sidechains, a vote cannot be checked.
+	datum_test(!datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
+	t.votable_known = true;
+	t.votable_count = 2;
+	t.votable_bundles[0] = 1;
+	t.votable_bundles[1] = 0;
+	datum_test(datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
+	datum_test(datum_m4_fits_template(follow, sizeof(follow), &t));
+	// A bundle index past the bundles pending.
+	t.votable_bundles[0] = 0;
+	datum_test(!datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
+	// A sidechain more or less.
+	t.votable_bundles[0] = 1;
+	t.votable_count = 3;
+	datum_test(!datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
+	// Two bytes where one would do.
+	t.votable_count = 2;
+	const unsigned char two_bytes[] = { 0x6a, 0x09, 0xd7, 0x7d, 0x17, 0x76, 0x02, 0x00, 0x00, 0xff, 0xff };
+	datum_test(!datum_m4_fits_template(two_bytes, sizeof(two_bytes), &t));
+	printf("  a vote the pool sends has to fit the template's sidechains and bundles\n");
 }
 
 // Build a fake template holding one M7 accept and the transactions given.
@@ -573,6 +662,8 @@ static void the_pool_can_ack_more_than_one_proposal(void) {
 	memcpy(tpl.commitments[0].output_script, m4_template, sizeof(m4_template));
 	tpl.commitments[0].output_script_len = sizeof(m4_template);
 	tpl.commitments_count = 1;
+	// The node says there is no sidechain to vote on, so following the leader fits.
+	tpl.votable_known = true;
 	job.block_template = &tpl;
 	job.coinbase_value = 5000000000ULL;
 
@@ -938,7 +1029,10 @@ void datum_blocktemplates_tests(void) {
 	take_the_value_and_the_commitments();
 	a_coinbase_paying_nothing_is_refused();
 	a_truncated_coinbase_is_refused();
-	too_many_commitments_is_refused_not_truncated();
+	too_many_commitments_leaves_the_rest_out();
+	a_proposal_fits();
+	only_what_chains_reads_as_a_bid_is_one();
+	a_pool_vote_has_to_fit_the_template();
 	a_bmm_accept_needs_its_request_in_the_block();
 	a_pool_sent_accept_is_checked_against_our_own_block();
 	commitments_without_bmm_are_left_alone();

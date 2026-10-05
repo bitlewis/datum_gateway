@@ -201,11 +201,14 @@ bool txn_has_bmm_request_output(const uint8_t *d, uint32_t size) {
 		p += 8; // value
 		if (!txn_varint(d, size, &p, &len) || (uint64_t)p + len > size) goto unreadable;
 		const uint8_t *s = &d[p];
-		// OP_RETURN, a direct push, then 00bf00<slot>: the same shape the scan
-		// looks for, at the start of a script rather than anywhere.
-		if (len >= 5 && s[0] == 0x6a && s[1] >= 1 && s[1] <= 0x4b &&
-		    s[2] == 0x00 && s[3] == 0xbf && s[4] == 0x00) return true;
-		p += (uint32_t)len;
+		// Exactly what Chains takes for a request: output 0 only, OP_RETURN,
+		// a push of 68 bytes, 00bf00, the slot, the sidechain block and the
+		// previous mainchain block. Anything looser lets a transaction that
+		// Chains does not read as a request -- and so answers with no accept
+		// -- make every job empty work, for free, since this pool never mines
+		// it and its fee is never paid.
+		return i == 0 && len == 70 && s[0] == 0x6a && s[1] == 0x44 &&
+		       s[2] == 0x00 && s[3] == 0xbf && s[4] == 0x00;
 	}
 	return false;
 unreadable:
@@ -449,6 +452,7 @@ bool datum_template_parse_coinbasetxn(T_DATUM_TEMPLATE_DATA *tdata, const char *
 
 	uint64_t total = 0;
 	tdata->commitments_count = 0;
+	tdata->bmm_accepts_dropped = false;
 	for (int64_t i = 0; i < nout; i++) {
 		if (p + 8 > len) { DLOG_ERROR("coinbasetxn: truncated value on output %lld", (long long)i); goto done; }
 		uint64_t val = 0;
@@ -471,15 +475,17 @@ bool datum_template_parse_coinbasetxn(T_DATUM_TEMPLATE_DATA *tdata, const char *
 		if (spk_len >= 6 && spk[1] == 0x24 &&
 		    spk[2] == 0xaa && spk[3] == 0x21 && spk[4] == 0xa9 && spk[5] == 0xed) continue;
 
-		if (tdata->commitments_count >= DATUM_MAX_COMMITMENTS) {
-			// Refusing beats truncating. A dropped commitment is a vote that
-			// silently did not happen, and a dropped M7 is an invalid block.
-			DLOG_ERROR("coinbasetxn carries more than %d commitments", DATUM_MAX_COMMITMENTS);
-			goto done;
-		}
-		if (spk_len > DATUM_MAX_COMMITMENT_SCRIPT) {
-			DLOG_ERROR("coinbasetxn commitment is %zu bytes, max %d", spk_len, DATUM_MAX_COMMITMENT_SCRIPT);
-			goto done;
+		if (tdata->commitments_count >= DATUM_MAX_COMMITMENTS || spk_len > DATUM_MAX_COMMITMENT_SCRIPT) {
+			// Leaving the message out beats refusing the template, which left
+			// every miner on stale work until the message cleared. A vote, an
+			// ack or a proposal not carried is legal. A BMM accept not carried
+			// is not -- its request is in the block -- so the job is marked,
+			// and served empty work.
+			const bool accept = spk_len >= 6 && spk[1] <= 0x4b && spk[2] == 0xd1 && spk[3] == 0x61 && spk[4] == 0x73 && spk[5] == 0x68;
+			if (accept) tdata->bmm_accepts_dropped = true;
+			DLOG_WARN("coinbasetxn commitment of %zu bytes left out (room for %d of at most %d bytes)%s",
+			          spk_len, DATUM_MAX_COMMITMENTS, DATUM_MAX_COMMITMENT_SCRIPT, accept ? ": a BMM accept, so this job is empty work" : "");
+			continue;
 		}
 		memcpy(tdata->commitments[tdata->commitments_count].output_script, spk, spk_len);
 		tdata->commitments[tdata->commitments_count].output_script_len = (int)spk_len;
@@ -647,6 +653,23 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 		}
 	}
 	
+	tdata->votable_known = false;
+	tdata->votable_count = 0;
+	{
+		json_t *votable = json_object_get(gbt, "drivechain_votable");
+		if (votable && json_is_array(votable) && json_array_size(votable) <= DATUM_MAX_VOTABLE) {
+			tdata->votable_known = true;
+			for (size_t v = 0; v < json_array_size(votable); v++) {
+				json_t *n = json_array_get(votable, v);
+				if (!json_is_integer(n) || json_integer_value(n) < 0 || json_integer_value(n) > 0xFFFF) {
+					tdata->votable_known = false;
+					break;
+				}
+				tdata->votable_bundles[v] = (uint16_t)json_integer_value(n);
+			}
+			if (tdata->votable_known) tdata->votable_count = (int)json_array_size(votable);
+		}
+	}
 	tdata->mintime = json_integer_value(json_object_get(gbt, "mintime"));
 	if (!tdata->mintime) {
 		DLOG_ERROR("Missing data from GBT JSON (mintime)");

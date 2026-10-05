@@ -609,9 +609,12 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		s->pool_addr_script_len = datum_config.override_mining_pool_scriptsig_len;
 		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptsig, datum_config.override_mining_pool_scriptsig_len);
 		s->is_datum_job = true;
-		if (s->available_coinbase_outputs_count == 0) {
-			empty_only = true;
-		}
+		// No payouts from the pool (it did not answer, or the value is below
+		// what it pays out): the plain coinbase pays the pool's address. With
+		// commitments, the sized types are built all the same -- paying the
+		// pool's address, and carrying them -- as in solo mode; a copy of the
+		// plain coinbase would leave the template's BMM accepts and votes out.
+		empty_only = (s->available_coinbase_outputs_count == 0 && s->commitments_count == 0);
 	} else {
 		// No pool
 		s->pool_addr_script_len = addr_2_output_script(datum_config.mining_pool_address, &s->pool_addr_script[0], 64);
@@ -871,27 +874,40 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 // replace the other.
 // Whether the job's commitment set contains a BMM accept, and therefore
 // whether dropping the set changes a valid block into an invalid one.
-void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
-	unsigned char tag[4];
-	s->has_bmm_accept = false;
-	s->has_bmm_request = false;
+//
+// The request depends on the template alone, so it is settled once, when the
+// job is made (datum_job_note_bmm_request), and never cleared again: clearing
+// it while the coinbaser rescans let a client served in that moment take the
+// full coinbase without the accept. The accept is worked out on the side and
+// published with a single store.
+void datum_job_note_bmm_request(T_DATUM_STRATUM_JOB *s) {
+	bool request = false;
 	if (s->block_template) {
 		for (uint32_t t = 0; t < s->block_template->txn_count; t++) {
-			// Exactly, not by the byte scan: a false match here empties the
-			// job. See txn_has_bmm_request_output.
+			// Exactly as Chains reads one: see txn_has_bmm_request_output.
 			if (txn_has_bmm_request_output(s->block_template->txns[t].txn_data_binary, s->block_template->txns[t].size)) {
-				s->has_bmm_request = true;
+				request = true;
 				break;
 			}
 		}
 	}
+	__atomic_store_n(&s->has_bmm_request, request, __ATOMIC_RELEASE);
+}
+
+void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
+	unsigned char tag[4];
+	bool accept = false;
 	for (int i = 0; i < s->commitments_count; i++) {
 		if (datum_commitment_tag(s->commitments[i].output_script, s->commitments[i].output_script_len, tag)
 		    && tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68) {
-			s->has_bmm_accept = true;
-			return;
+			accept = true;
+			break;
 		}
 	}
+	// An accept of the template that did not fit: the block's accepts are not
+	// all there, whatever this job carries.
+	if (s->block_template && s->block_template->bmm_accepts_dropped) accept = false;
+	__atomic_store_n(&s->has_bmm_accept, accept, __ATOMIC_RELEASE);
 }
 
 // Whether a client on this coinbase type may be served this job.
@@ -906,8 +922,10 @@ bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect) {
 	if (!j || cbselect < 0 || cbselect >= MAX_COINBASE_TYPES) return false;
 	// A bid in the block and no accept in the job: whatever coinbase is
 	// built, the block is invalid on the drivechain. Only empty work is safe.
-	if (j->has_bmm_request && !j->has_bmm_accept) return false;
-	if (!j->has_bmm_accept) return true;
+	const bool request = __atomic_load_n(&j->has_bmm_request, __ATOMIC_ACQUIRE);
+	const bool accept = __atomic_load_n(&j->has_bmm_accept, __ATOMIC_ACQUIRE);
+	if (request && !accept) return false;
+	if (!accept) return true;
 	return j->coinbase[cbselect].carries_commitments;
 }
 
@@ -948,7 +966,7 @@ void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[
 		const int clen = s->commitments[i].output_script_len;
 		unsigned char t[4];
 		if (datum_commitment_tag(s->commitments[i].output_script, clen, t) && !memcmp(t, tag, 4)) {
-			s->commitments_size -= 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
+			s->commitments_size -= 8 + (clen < 0xFD ? 1 : 3) + clen;
 			continue;
 		}
 		if (kept != i) s->commitments[kept] = s->commitments[i];
@@ -971,7 +989,7 @@ static int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
 		memcpy(s->commitments[s->commitments_count].output_script, s->block_template->commitments[i].output_script, clen);
 		s->commitments[s->commitments_count].output_script_len = clen;
 		// 8 bytes of value, the script's own length prefix, then the script.
-		s->commitments_size += 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
+		s->commitments_size += 8 + (clen < 0xFD ? 1 : 3) + clen;
 		s->commitments_count++;
 	}
 	if (s->commitments_count) {
@@ -1005,6 +1023,49 @@ int datum_m4_entry_count(const unsigned char *script, int len) {
 	if (version == 0x01) return body;
 	if (version == 0x02) return body / 2;
 	return -1; // repeat-previous or leading-by-50: no vector to compare
+}
+
+// Whether a vote (M4) fits the block it would go in, by what the node said of
+// the sidechains in getblocktemplate (drivechain_votable): one entry per active
+// sidechain, each abstaining, downvoting, or naming a bundle that is pending.
+// A vote that does not fit makes the block invalid, so one that cannot be
+// checked does not fit either. Not an M4: nothing to check.
+bool datum_m4_fits_template(const unsigned char *script, int len, const T_DATUM_TEMPLATE_DATA *t) {
+	unsigned char tag[4];
+	if (!datum_commitment_tag(script, len, tag)) return true;
+	if (!(tag[0] == 0xd7 && tag[1] == 0x7d && tag[2] == 0x17 && tag[3] == 0x76)) return true;
+	if (!t || !t->votable_known) return false;
+	int i = 1;
+	const unsigned char op = script[i++];
+	if (op == 0x4c) i += 1;
+	else if (op == 0x4d) i += 2;
+	else if (op == 0x4e) i += 4;
+	else if (op > 0x4b) return false;
+	i += 4; // the tag
+	if (i >= len) return false;
+	const unsigned char version = script[i++];
+	const int body = len - i;
+	if (version == 0x00 || version == 0x03) return body == 0; // repeat the last votes, or follow the leader
+	if (version == 0x01) {
+		if (body != t->votable_count) return false;
+		for (int v = 0; v < body; v++) {
+			const unsigned char e = script[i + v];
+			if (e != 0xFF && e != 0xFE && e >= t->votable_bundles[v]) return false;
+		}
+		return true;
+	}
+	if (version == 0x02) {
+		if (body % 2 || body / 2 != t->votable_count) return false;
+		bool needed = false;
+		for (int v = 0; v < body / 2; v++) {
+			const unsigned int e = (unsigned int)script[i + 2*v] | ((unsigned int)script[i + 2*v + 1] << 8);
+			if (e != 0xFFFF && e != 0xFFFE && e >= t->votable_bundles[v]) return false;
+			// The two byte form only where an entry does not fit in one.
+			if (e > 0xFD && e != 0xFFFF && e != 0xFFFE) needed = true;
+		}
+		return needed;
+	}
+	return false;
 }
 
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free) {
@@ -1142,6 +1203,12 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 							if (n >= 0) { theirs = n; break; }
 						}
 					}
+					if (!datum_m4_fits_template(cscript, clen, s->block_template)) {
+						DLOG_ERROR("Pool sent an M4 that does not fit this template's sidechains and bundles "
+						           "(or the node did not say what they are). Not carrying it: a vote that does "
+						           "not fit is an invalid block.");
+						continue;
+					}
 					if (mine >= 0 && theirs >= 0 && mine != theirs) {
 						DLOG_ERROR("Pool sent an M4 voting for %d sidechains where this template has %d. "
 						           "Keeping the template's: a vector of the wrong length is an invalid "
@@ -1199,7 +1266,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			// 8 bytes of value + the script's own length prefix + the script.
 			// Scripts past 0x4B need a longer prefix; commitments routinely
 			// are, so this is counted rather than assumed to be one byte.
-			s->commitments_size += 8 + (clen < 0x4C ? 1 : (clen < 0x100 ? 2 : 3)) + clen;
+			s->commitments_size += 8 + (clen < 0xFD ? 1 : 3) + clen;
 			s->commitments_count++;
 		}
 		if (from_template && ccount) {
@@ -1288,6 +1355,10 @@ void *datum_coinbaser_thread(void *ptr) {
 			// fetch remote coinbaser for job
 			DLOG_DEBUG("Job %d needs a coinbaser!", sjob);
 			if (datum_protocol_is_active()) {
+				// The template's own commitments, whatever comes of the fetch:
+				// it gives up on several paths (a timeout, a lost connection, a
+				// value it does not pay out) without parsing anything.
+				commitments_from_template(s);
 				i = datum_protocol_coinbaser_fetch(s);
 			} else {
 				// No pool: nothing to pay but our own address. The template's

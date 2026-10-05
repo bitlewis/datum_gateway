@@ -53,7 +53,7 @@ void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[
 // Entries in an M4's upvote vector, or -1 where it carries none. Exposed for
 // the tests: a vector of the wrong length is an invalid block.
 int datum_m4_entry_count(const unsigned char *script, int len);
-// Whether a vote (M4) fits the template's sidechains and their pending bundles.
+// Whether a vote (M4) fits the template's sidechains and their pending bundles; true where the node does not say.
 bool datum_m4_fits_template(const unsigned char *script, int len, const T_DATUM_TEMPLATE_DATA *t);
 
 #endif

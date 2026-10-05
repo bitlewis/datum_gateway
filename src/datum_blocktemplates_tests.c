@@ -190,8 +190,9 @@ static void a_pool_vote_has_to_fit_the_template(void) {
 	T_DATUM_TEMPLATE_DATA t = { 0 };
 	const unsigned char one_byte[] = { 0x6a, 0x07, 0xd7, 0x7d, 0x17, 0x76, 0x01, 0x00, 0xff };
 	const unsigned char follow[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x03 };
-	// Without the node's word on the sidechains, a vote cannot be checked.
-	datum_test(!datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
+	// A node that does not say (an enforcer) leaves it to the check against the
+	// template's own vote: the pool's votes still go through, as on eCash.
+	datum_test(datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
 	t.votable_known = true;
 	t.votable_count = 2;
 	t.votable_bundles[0] = 1;
@@ -662,8 +663,6 @@ static void the_pool_can_ack_more_than_one_proposal(void) {
 	memcpy(tpl.commitments[0].output_script, m4_template, sizeof(m4_template));
 	tpl.commitments[0].output_script_len = sizeof(m4_template);
 	tpl.commitments_count = 1;
-	// The node says there is no sidechain to vote on, so following the leader fits.
-	tpl.votable_known = true;
 	job.block_template = &tpl;
 	job.coinbase_value = 5000000000ULL;
 

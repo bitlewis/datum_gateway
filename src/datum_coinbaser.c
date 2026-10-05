@@ -1028,13 +1028,14 @@ int datum_m4_entry_count(const unsigned char *script, int len) {
 // Whether a vote (M4) fits the block it would go in, by what the node said of
 // the sidechains in getblocktemplate (drivechain_votable): one entry per active
 // sidechain, each abstaining, downvoting, or naming a bundle that is pending.
-// A vote that does not fit makes the block invalid, so one that cannot be
-// checked does not fit either. Not an M4: nothing to check.
+// A vote that does not fit makes the block invalid. A node that does not say
+// (an enforcer, as on eCash) leaves the check to the one against the
+// template's own M4, in datum_coinbaser_v2_parse. Not an M4: nothing to check.
 bool datum_m4_fits_template(const unsigned char *script, int len, const T_DATUM_TEMPLATE_DATA *t) {
 	unsigned char tag[4];
 	if (!datum_commitment_tag(script, len, tag)) return true;
 	if (!(tag[0] == 0xd7 && tag[1] == 0x7d && tag[2] == 0x17 && tag[3] == 0x76)) return true;
-	if (!t || !t->votable_known) return false;
+	if (!t || !t->votable_known) return true;
 	int i = 1;
 	const unsigned char op = script[i++];
 	if (op == 0x4c) i += 1;
@@ -1204,9 +1205,8 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 						}
 					}
 					if (!datum_m4_fits_template(cscript, clen, s->block_template)) {
-						DLOG_ERROR("Pool sent an M4 that does not fit this template's sidechains and bundles "
-						           "(or the node did not say what they are). Not carrying it: a vote that does "
-						           "not fit is an invalid block.");
+						DLOG_ERROR("Pool sent an M4 that does not fit this template's sidechains and bundles. "
+						           "Not carrying it: a vote that does not fit is an invalid block.");
 						continue;
 					}
 					if (mine >= 0 && theirs >= 0 && mine != theirs) {

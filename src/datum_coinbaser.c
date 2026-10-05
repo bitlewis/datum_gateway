@@ -410,6 +410,11 @@ int datum_stratum_coinbase_fit_to_template(int max_sz, int fixed_bytes, T_DATUM_
 }
 
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block) {
+	// The subsidy-only coinbase is built for every job, not only for new-block jobs: a job of
+	// any kind is served as empty work when no coinbase type can carry it safely (see
+	// send_mining_notify), and a coinbase that was never built would make blocks no node accepts.
+	const bool build_subsidy = true;
+	(void)new_block;
 	char cb[512];
 	int cb_input_sz = 0;
 	bool space_for_en_in_coinbase = false;
@@ -480,7 +485,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		cb2idx[0] = 8;
 		cb2idx[0] += append_bitcoin_varint_hex(1 + witness_outputs(s), &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
 		
-		if (new_block) {
+		if (build_subsidy) {
 			// copy the beginning to the subsidy-only
 			memcpy(&s->subsidy_only_coinbase.coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0]);
 			pk_u64le(s->subsidy_only_coinbase.coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
@@ -488,7 +493,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		}
 	} else {
 		// we're already at the point in coinb1 where we need an output count, which will be 3
-		if (new_block) {
+		if (build_subsidy) {
 			j = cb1idx[0];
 		}
 		cb1idx[0] += append_bitcoin_varint_hex(2 + witness_outputs(s), &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
@@ -496,7 +501,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		// append extranonce op_return
 		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "0000000000000000106a0e%04" PRIx16, s->enprefix);
 		
-		if (new_block) {
+		if (build_subsidy) {
 			// copy the beginning to the subsidy-only
 			memcpy(&s->subsidy_only_coinbase.coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0]);
 			k = append_bitcoin_varint_hex(2, &s->subsidy_only_coinbase.coinb1[j]); // extranonce and us
@@ -506,7 +511,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	// finish off "empty" coinbase
 	
 	// append our payout output value and script
-	if (new_block) {
+	if (build_subsidy) {
 		j = cb2idx[0];
 	}
 	
@@ -517,7 +522,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		cb2idx[0]+=2;
 	}
 	
-	if (new_block) {
+	if (build_subsidy) {
 		k = cb2idx[0];
 	}
 	
@@ -527,7 +532,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	// lock time
 	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
 	
-	if (new_block) {
+	if (build_subsidy) {
 		// Append the subsidy-only payout to the subsidy_only_coinbase
 		sprintf(&s->subsidy_only_coinbase.coinb2[j], "%016llx", (unsigned long long)__builtin_bswap64(block_reward(s->height))); // subsidy calc for height
 		memcpy(&s->subsidy_only_coinbase.coinb2[j+16], &s->coinbase[0].coinb2[j+16], k-j-16);
@@ -552,7 +557,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		s->coinbase[0].coinb2_len++;
 	}
 	
-	if (new_block) {
+	if (build_subsidy) {
 		i = strlen(s->subsidy_only_coinbase.coinb1);
 		s->subsidy_only_coinbase.coinb1_len = 0;
 		for(j=0;j<i;j+=2) {

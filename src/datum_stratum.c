@@ -375,7 +375,8 @@ void datum_stratum_v1_socket_thread_init(T_DATUM_THREAD_DATA *my) {
 	sdata->latest_stratum_job_index = global_latest_stratum_job_index;
 	sdata->cur_stratum_job = global_cur_stratum_jobs[global_latest_stratum_job_index];
 	pthread_rwlock_unlock(&stratum_global_job_ptr_lock);
-	sdata->new_job = false;
+	// So that the job state machine runs for the current job in this new thread, as it did in the others.
+	sdata->new_job = true;
 	sdata->last_sent_job_state = 0;
 	
 	sdata->next_kick_check_tsms = current_time_millis() + 10000;
@@ -1642,12 +1643,15 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 		get_target_from_diff(m->quickdiff_target, m->quickdiff_value);
 	}
 	
-	// We'll use the client's send buffer for sanity, since in this environment it wont result in a partial send and we can just build up the string in the output buffer
-	datum_socket_send_string_to_client(c, "{\"id\":null,\"method\":\"mining.notify\",\"params\":[");
-	
 	if (j->job_state >= JOB_STATE_FULL_PRIORITY_WAIT_COINBASER) {
 		if (((T_DATUM_STRATUM_THREADPOOL_DATA *)t->app_thread_data)->full_coinbase_ready) {
 			full_coinbase = true;
+		} else if (need_coinbaser_rwlocks_init_done) {
+			// A thread that started after this job (a miner that just connected) never ran the
+			// job state machine for it: ask the job itself whether its coinbases are complete.
+			pthread_rwlock_rdlock(&need_coinbaser_rwlocks[j->global_index]);
+			full_coinbase = !j->need_coinbaser;
+			pthread_rwlock_unlock(&need_coinbaser_rwlocks[j->global_index]);
 		}
 	}
 	
@@ -1678,11 +1682,17 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 		static uint64_t warned_job[MAX_COINBASE_TYPES];
 		if (warned_job[cbselect] != j->global_index) {
 			warned_job[cbselect] = j->global_index;
-			DLOG_WARN("Coinbase type %d cannot carry this job's %d commitment(s) including a BMM accept; "
-			          "serving empty work to clients on that type rather than a block the enforcer would reject.",
-			          cbselect, j->commitments_count);
+			if (j->has_bmm_request && !j->has_bmm_accept) {
+				DLOG_INFO("Job %s has a BMM request in its block and no accept loaded (yet); serving empty work until it has.", j->job_id);
+			} else {
+				DLOG_WARN("Coinbase type %d cannot carry this job's %d commitment(s) including a BMM accept; "
+				          "serving empty work to clients on that type rather than a block the enforcer would reject.",
+				          cbselect, j->commitments_count);
+			}
 		}
 		new_block = true;
+		// An empty job is a new job, not the same job at a new difficulty.
+		quickdiff = false;
 	}
 	
 	cb = &j->coinbase[cbselect];
@@ -1698,7 +1708,14 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 			cb = &j->subsidy_only_coinbase;
 		}
 	}
+	if (cb->coinb1_len == 0 || cb->coinb2_len == 0) {
+		// Never serve work over a coinbase that was not built: no node would take its blocks.
+		DLOG_ERROR("Job %s has no coinbase built for what this client was to get; not sending it.", j->job_id);
+		return -1;
+	}
 	
+	// We'll use the client's send buffer for sanity, since in this environment it wont result in a partial send and we can just build up the string in the output buffer
+	datum_socket_send_string_to_client(c, "{\"id\":null,\"method\":\"mining.notify\",\"params\":[");
 	// this may look silly, but the send buffer doesn't get emptied until this thread's loop runs. so might as well just utilize it
 	// for code readability purposes at the expense of a few extra calls.
 	datum_socket_send_string_to_client(c, s);
@@ -2241,6 +2258,12 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	
 	// start as not a datum job.  if we have coinbase data and such for it down the line, this will get updated.
 	s->is_datum_job = false;
+	
+	// Whether the block carries a BMM request, from the start: until the coinbaser has loaded the
+	// commitments (and with them the accept), a job whose block has a request must not be served
+	// as a block (see datum_job_coinbase_is_safe), however long the coinbaser takes, or if it fails.
+	s->commitments_count = 0;
+	datum_job_note_bmm_accept(s);
 	
 	// prep the coinbase txn(s) for this job
 	generate_base_coinbase_txns_for_stratum_job(s, s->is_new_block);

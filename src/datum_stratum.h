@@ -295,6 +295,7 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, int job_state);
 void stratum_job_merkle_root_calc(T_DATUM_STRATUM_JOB *s, unsigned char *coinbase_txn_hash, unsigned char *merkle_root_output);
 bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect);
+void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s);
 int datum_stratum_coinbase_type_by_name(const char *s);
 int datum_stratum_coinbase_type_from_rules(const char *ua);
 int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t coinbase_txn_size, T_DATUM_STRATUM_JOB *job, T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const char *block_hash_hex, bool empty_work);

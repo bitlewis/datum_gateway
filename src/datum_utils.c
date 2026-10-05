@@ -317,6 +317,24 @@ int append_bitcoin_varint_hex(uint64_t n, char *s) {
 	}
 }
 
+// The block height as BIP34 requires it at the start of the coinbase script,
+// which is exactly what Bitcoin Core writes with CScript() << height: OP_0 for
+// zero, OP_1 to OP_16 for one to sixteen, and above that the minimal number
+// push append_UNum_hex produces.
+//
+// The small heights only matter on a chain that enforces BIP34 from its first
+// block. A Chains testnet started doing that after an audit, and every block
+// this gateway found below 17 came back bad-cb-height: it wrote 01 0e for
+// height 14 where the node wanted OP_14.
+int append_bip34_height_hex(uint64_t height, char *s) {
+	if (height <= 16) {
+		uchar_to_hex(s, height ? (uint8_t)(0x50 + height) : 0x00);
+		s[2] = '\0';
+		return 2;
+	}
+	return append_UNum_hex(height, s);
+}
+
 int append_UNum_hex(uint64_t n, char *s) {
 	int count = 0;
 	uint64_t temp = n;

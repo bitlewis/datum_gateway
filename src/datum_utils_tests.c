@@ -117,7 +117,25 @@ void datum_utils_tests_secure_strequals(void) {
 	datum_test(datum_secure_strequals(NULL, 0, ""));
 }
 
+// Each height as Bitcoin Core encodes it with CScript() << height, which is
+// what BIP34 compares the start of the coinbase against.
+void datum_utils_tests_bip34_height(void) {
+	static const struct { uint64_t h; const char *hex; } cases[] = {
+		{ 0, "00" }, { 1, "51" }, { 14, "5e" }, { 16, "60" },
+		{ 17, "0111" }, { 127, "017f" }, { 128, "028000" }, { 255, "02ff00" },
+		{ 256, "020001" }, { 971015, "0307d10e" },
+	};
+	char buf[32];
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		int n = append_bip34_height_hex(cases[i].h, buf);
+		datum_test(n == (int)strlen(cases[i].hex));
+		datum_test(strcmp(buf, cases[i].hex) == 0);
+	}
+	printf("  BIP34 heights are written the way Bitcoin Core writes them\n");
+}
+
 void datum_utils_tests(void) {
+	datum_utils_tests_bip34_height();
 	datum_utils_tests_hex();
 	datum_utils_tests_secure_strequals();
 }

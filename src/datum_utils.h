@@ -62,6 +62,7 @@ int compare_hashes(const uint8_t *hash1, const uint8_t *hash2);
 unsigned long long block_reward(unsigned int block_height);
 int append_bitcoin_varint_hex(uint64_t n, char *s);
 int append_UNum_hex(uint64_t n, char *s);
+int append_bip34_height_hex(uint64_t height, char *s);
 void panic_from_thread(int a);
 bool double_sha256(void *out, const void *in, size_t length);
 void hex_to_bin_le(const char *hex, unsigned char *bin);

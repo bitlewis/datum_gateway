@@ -14,3 +14,7 @@ datum_gateway
 *.orig
 *.rej
 *~
+
+# Local: build output and notes for the coding assistant
+build/
+CLAUDE.md

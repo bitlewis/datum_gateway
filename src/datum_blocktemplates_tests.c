@@ -613,6 +613,27 @@ static void pool_commitments_follow_chains_rules(void) {
 	datum_test(acks3 == 1 && acks4 == 1);
 	datum_test(m4s <= 1);
 	printf("  pool commitments follow Chains' rules: one per kind and slot, one M4, one push each\n");
+
+	// The template's own ack for slot 3 is replaced by the pool's, not taken for a duplicate of it.
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+	unsigned char own3[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x03 };
+	for (int i = 7; i < 39; i++) own3[i] = 0x77;
+	memcpy(tpl.commitments[0].output_script, own3, sizeof(own3));
+	tpl.commitments[0].output_script_len = sizeof(own3);
+	tpl.commitments_count = 1;
+	tpl.from_enforcer = true;
+	job.block_template = &tpl;
+	job.coinbase_value = 5000000000ULL;
+	n = 0;
+	cb[n++] = 0x80 | 0x01;
+	cb[n++] = 1;
+	cb[n++] = 39; cb[n++] = 0;
+	memcpy(&cb[n], ack3a, 39); n += 39;
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+	datum_test(job.commitments_count == 1);
+	datum_test(job.commitments[0].output_script[7] == ack3a[7]);
+	printf("  the pool's ack replaces the template's for the same sidechain\n");
 }
 
 static void a_malformed_pool_payload_leaves_the_template_whole(void) {

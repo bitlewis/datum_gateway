@@ -1158,6 +1158,9 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		unsigned char cleared[DATUM_MAX_COMMITMENTS][4];
 		int cleared_count = 0;
 		bool pool_m4 = false;
+		// The kinds (tag and slot) of the pool's messages taken so far.
+		unsigned char pool_kinds[DATUM_MAX_COMMITMENTS][5];
+		int pool_kinds_count = 0;
 		for (int ci = 0; ci < ccount; ci++) {
 			if (cidx + 2 > cblen) {
 				DLOG_ERROR("Coinbaser commitment %d has no length. Using default/empty", ci);
@@ -1212,12 +1215,11 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 						continue;
 					}
 					if (per_slot && clen > 6) {
+						// Among the pool's own: the template's of the same kind are cleared below,
+						// when the pool's replace them.
 						bool duplicate = false;
-						for (int q = 0; q < s->commitments_count && !duplicate; q++) {
-							unsigned char other[4];
-							const unsigned char *o = s->commitments[q].output_script;
-							const int olen = s->commitments[q].output_script_len;
-							duplicate = olen > 6 && datum_commitment_tag(o, olen, other) && !memcmp(other, tag, 4) && o[6] == cscript[6];
+						for (int q = 0; q < pool_kinds_count && !duplicate; q++) {
+							duplicate = !memcmp(pool_kinds[q], tag, 4) && pool_kinds[q][4] == cscript[6];
 						}
 						if (duplicate) {
 							DLOG_ERROR("Pool sent a second commitment of one kind for sidechain %d. Dropping it: a block has one.", cscript[6]);
@@ -1316,6 +1318,14 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			}
 			memcpy(s->commitments[s->commitments_count].output_script, cscript, clen);
 			s->commitments[s->commitments_count].output_script_len = clen;
+			{
+				unsigned char kind[4];
+				if (clen > 6 && pool_kinds_count < DATUM_MAX_COMMITMENTS && datum_commitment_tag(cscript, clen, kind)) {
+					memcpy(pool_kinds[pool_kinds_count], kind, 4);
+					pool_kinds[pool_kinds_count][4] = cscript[6];
+					pool_kinds_count++;
+				}
+			}
 			// 8 bytes of value + the script's own length prefix + the script.
 			// Scripts past 0x4B need a longer prefix; commitments routinely
 			// are, so this is counted rather than assumed to be one byte.

@@ -40,6 +40,8 @@ int datum_coinbaser_init(void);
 void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s, int coinbase_index, int remaining_size, bool space_for_en_in_coinbase, int *cb1idx, int *cb2idx, bool special_coinb1);
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only);
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block);
+// Whether a pool payout script is a standard address (P2PKH, P2SH, segwit).
+bool datum_payout_script_is_standard(const unsigned char *script, int len);
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free);
 
 // The 4-byte BIP300 message tag a commitment carries, or false if the script is
@@ -50,9 +52,9 @@ bool datum_commitment_tag(const unsigned char *script, int len, unsigned char ou
 
 // Which of the job's commitments a coinbase with `budget` bytes for them
 // carries (use[k]), how many and their bytes: every BMM accept or none, then
-// votes, acks, bundles, proposals and the rest while they fit. True if every
-// accept is in. Exposed for the tests.
-bool datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use, int *count, int *size);
+// votes, acks, bundles, proposals and the rest while they fit. Returns how
+// many accepts it put in. Exposed for the tests.
+int datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use, int *count, int *size);
 
 // Load the template's own commitments into the job; their bytes in the coinbase.
 int commitments_from_template(T_DATUM_STRATUM_JOB *s);

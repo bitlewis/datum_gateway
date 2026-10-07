@@ -635,6 +635,52 @@ static void pool_commitments_follow_chains_rules(void) {
 	datum_test(job.commitments_count == 1);
 	datum_test(job.commitments[0].output_script[7] == ack3a[7]);
 	printf("  the pool's ack replaces the template's for the same sidechain\n");
+
+	// The same slot twice in two encodings (a direct push and PUSHDATA1, both
+	// of which Chains reads), the same proposal twice, and payouts that are
+	// not addresses: one of each kind is carried, and only the address is paid.
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+	tpl.from_enforcer = true;
+	job.block_template = &tpl;
+	job.coinbase_value = 5000000000ULL;
+	unsigned char ack3long[40] = { 0x6a, 0x4c, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x03 };
+	for (int i = 8; i < 40; i++) ack3long[i] = 0x55;
+	unsigned char m1[12] = { 0x6a, 0x0a, 0xd5, 0xe0, 0xc4, 0xaf, 0x07, 1, 2, 3, 4, 5 };
+	n = 0;
+	cb[n++] = 0x80 | 0x01;
+	cb[n++] = 4;
+	const unsigned char *scripts2[4] = { ack3a, ack3long, m1, m1 };
+	const int lens2[4] = { 39, 40, 12, 12 };
+	for (int i = 0; i < 4; i++) {
+		cb[n++] = (unsigned char)lens2[i]; cb[n++] = 0;
+		memcpy(&cb[n], scripts2[i], lens2[i]); n += lens2[i];
+	}
+	// Payouts: an OP_RETURN with an accept's tag, an escrow script
+	// (OP_DRIVECHAIN 01 <slot> OP_TRUE), then a P2WPKH address.
+	unsigned char opret[39] = { 0x6a, 0x25, 0xd1, 0x61, 0x73, 0x68, 0x09 };
+	unsigned char escrow[4] = { 0xb4, 0x01, 0x03, 0x51 };
+	unsigned char p2wpkh[22] = { 0x00, 0x14 };
+	const unsigned char *payees[3] = { opret, escrow, p2wpkh };
+	const int plens[3] = { 39, 4, 22 };
+	for (int i = 0; i < 3; i++) {
+		pk_u64le(cb, n, 1000000ULL); n += 8;
+		cb[n++] = (unsigned char)plens[i];
+		memcpy(&cb[n], payees[i], plens[i]); n += plens[i];
+	}
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+	int acks = 0, m1s = 0;
+	for (int c = 0; c < job.commitments_count; c++) {
+		unsigned char t[4];
+		datum_test(datum_commitment_tag(job.commitments[c].output_script, job.commitments[c].output_script_len, t));
+		if (t[0] == 0xd6) acks++;
+		if (t[0] == 0xd5) m1s++;
+	}
+	datum_test(acks == 1 && m1s == 1);
+	datum_test(job.available_coinbase_outputs_count == 1);
+	datum_test(job.available_coinbase_outputs[0].output_script_len == 22);
+	datum_test(datum_payout_script_is_standard(p2wpkh, 22) && !datum_payout_script_is_standard(escrow, 4) && !datum_payout_script_is_standard(opret, 39));
+	printf("  one per slot whatever the push, no proposal twice, and pool payouts only to addresses\n");
 }
 
 static void a_malformed_pool_payload_leaves_the_template_whole(void) {
@@ -1169,24 +1215,24 @@ static void commitments_are_packed_by_rank(void) {
 	int count, size;
 
 	// Room for the accepts, the vote and the ack, not the proposal.
-	datum_test(datum_commitments_pack(&job, 300, use, &count, &size));
+	datum_test(datum_commitments_pack(&job, 300, use, &count, &size) == 2);
 	datum_test(!use[0] && use[1] && use[2] && use[3] && use[4]);
 	datum_test(count == 4 && size == 47 + 47 + 18 + 47);
 	// Room for the accepts and the vote only: the ack waits.
-	datum_test(datum_commitments_pack(&job, 47 + 47 + 18, use, &count, &size));
+	datum_test(datum_commitments_pack(&job, 47 + 47 + 18, use, &count, &size) == 2);
 	datum_test(!use[0] && !use[1] && use[2] && use[3] && use[4]);
 	// Room for one accept, not both: neither goes in, and the type is marked
 	// as not carrying them; what fits of the rest still does.
-	datum_test(!datum_commitments_pack(&job, 60, use, &count, &size));
+	datum_test(datum_commitments_pack(&job, 60, use, &count, &size) == 0);
 	datum_test(!use[2] && !use[4] && use[3] && count == 1 && size == 18);
 	// Room for everything: everything.
-	datum_test(datum_commitments_pack(&job, 5000, use, &count, &size));
+	datum_test(datum_commitments_pack(&job, 5000, use, &count, &size) == 2);
 	datum_test(count == 5 && size == job.commitments_size);
 	// No accepts at all: carried trivially.
 	static T_DATUM_STRATUM_JOB votes;
 	memset(&votes, 0, sizeof(votes));
 	put_commitment(&votes, HEX_M4);
-	datum_test(datum_commitments_pack(&votes, 0, use, &count, &size) && count == 0);
+	datum_test(datum_commitments_pack(&votes, 0, use, &count, &size) == 0 && count == 0);
 
 	// In a coinbase type: a proposal too large for it no longer takes the
 	// accepts out with it, and the output count matches what is written.
@@ -1199,7 +1245,7 @@ static void commitments_are_packed_by_rank(void) {
 	job.pool_addr_script[0] = 0x00; job.pool_addr_script[1] = 0x14;
 	int cb1idx[MAX_COINBASE_TYPES] = { 0 }, cb2idx[MAX_COINBASE_TYPES] = { 0 };
 	generate_coinbase_txns_for_stratum_job_subtypebysize(&job, 1, 300, true, cb1idx, cb2idx, false);
-	datum_test(job.coinbase[1].carries_accepts);
+	datum_test(job.coinbase[1].accepts == 2);
 	datum_test(strstr(job.coinbase[1].coinb2, "d1617368") != NULL);
 	datum_test(strstr(job.coinbase[1].coinb2, "d77d1776") != NULL);
 	datum_test(strstr(job.coinbase[1].coinb2, "d5e0c4af") == NULL);
@@ -1233,7 +1279,7 @@ static void the_plain_coinbase_carries_commitments_and_the_empty_one_is_current(
 	put_proposal(&job);
 
 	generate_base_coinbase_txns_for_stratum_job(&job, false);
-	datum_test(job.coinbase[0].carries_accepts);
+	datum_test(job.coinbase[0].accepts == 1);
 	datum_test(strstr(job.coinbase[0].coinb2, "d1617368") != NULL);
 	datum_test(strstr(job.coinbase[0].coinb2, "d77d1776") != NULL);
 	datum_test(strstr(job.coinbase[0].coinb2, "d5e0c4af") == NULL);
@@ -1246,17 +1292,29 @@ static void the_plain_coinbase_carries_commitments_and_the_empty_one_is_current(
 	datum_test(job.subsidy_only_coinbase.coinb2_len * 2 == (int)strlen(job.subsidy_only_coinbase.coinb2));
 	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "0014e8df018c7e326cc253faac7e46cdc51e68542c42") != NULL);
 
-	// The payout address changes before the coinbaser runs: the empty work
-	// pays the new one too, not only the full coinbases.
+	// The coinbaser lands, with an accept of the pool's merged into the set
+	// and the payout address changed meanwhile. Work on coinbase 0 and on the
+	// empty coinbase was handed out already: their bytes stay exactly as they
+	// were, so shares on that work still check out after it lands. The sized
+	// types are built from what holds now.
+	static T_DATUM_STRATUM_COINBASE before0, before_sub;
+	memcpy(&before0, &job.coinbase[0], sizeof(before0));
+	memcpy(&before_sub, &job.subsidy_only_coinbase, sizeof(before_sub));
+	put_commitment(&job, HEX_M7B);
 	strcpy(datum_config.mining_pool_address, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
 	generate_coinbase_txns_for_stratum_job(&job, false);
-	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "0014751e76e8199196d454941c45d1b3a323f1433bd6") != NULL);
-	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "e8df018c7e326cc253faac7e46cdc51e68542c42") == NULL);
-	datum_test(memcmp(job.subsidy_only_coinbase.coinb1, job.coinbase[0].coinb1, 20) == 0);
-	datum_test(job.coinbase[0].carries_accepts);
+	datum_test(memcmp(&before0, &job.coinbase[0], sizeof(before0)) == 0);
+	datum_test(memcmp(&before_sub, &job.subsidy_only_coinbase, sizeof(before_sub)) == 0);
+	datum_test(strstr(job.coinbase[1].coinb2, "0014751e76e8199196d454941c45d1b3a323f1433bd6") != NULL);
+	// Coinbase 0 has one of the job's two accepts now: with the bid in the
+	// block it is not served; type 1, built with both, is.
+	job.has_bmm_request = true;
+	datum_test(job.bmm_accepts == 2);
+	datum_test(job.coinbase[0].accepts == 1 && !datum_job_coinbase_is_safe(&job, 0));
+	datum_test(job.coinbase[1].accepts == 2 && datum_job_coinbase_is_safe(&job, 1));
 
 	memcpy(datum_config.mining_pool_address, saved_addr, sizeof(saved_addr));
-	printf("  coinbase 0 carries the template's commitments; the empty work's coinbase is rebuilt with it\n");
+	printf("  coinbase 0 carries the template's commitments, and it and the empty coinbase never change once handed out\n");
 }
 
 void datum_blocktemplates_tests(void) {

@@ -209,30 +209,40 @@ static void a_dropped_bmm_accept_makes_a_coinbase_unservable(void) {
 	j.commitments_count = 3;
 
 	// Votes only: a type that could not fit them abstains, which is legal.
-	j.has_bmm_accept = false;
-	j.coinbase[1].carries_accepts = false;
-	j.coinbase[4].carries_accepts = true;
+	j.bmm_accepts = 0;
+	j.coinbase[1].accepts = 0;
+	j.coinbase[4].accepts = 0;
 	datum_test(datum_job_coinbase_is_safe(&j, 1));
 	datum_test(datum_job_coinbase_is_safe(&j, 4));
 
-	// One of them is an accept: only a type that carries the accepts may be
-	// served.
-	j.has_bmm_accept = true;
+	// Two of them are accepts: only a type that carries both may be served.
+	j.bmm_accepts = 2;
+	j.coinbase[4].accepts = 2;
 	datum_test(!datum_job_coinbase_is_safe(&j, 1));
 	datum_test(datum_job_coinbase_is_safe(&j, 4));
 	datum_test(!datum_job_coinbase_is_safe(&j, 0));
 	datum_test(!datum_job_coinbase_is_safe(&j, MAX_COINBASE_TYPES));
 	datum_test(!datum_job_coinbase_is_safe(NULL, 1));
+	// An accept merged after a coinbase was built (the pool's, after coinbase
+	// 0 was made with the job): that coinbase no longer carries them all.
+	j.bmm_accepts = 3;
+	datum_test(!datum_job_coinbase_is_safe(&j, 4));
+	j.bmm_accepts = 2;
 
 	// A bid in the block with no accept in the job: no coinbase type can save
 	// it, not even one with room, so none is served.
-	j.has_bmm_accept = false;
+	j.bmm_accepts = 0;
 	j.has_bmm_request = true;
 	for (int cb = 0; cb < MAX_COINBASE_TYPES; cb++) datum_test(!datum_job_coinbase_is_safe(&j, cb));
-	// With the accept loaded, the types that carry it are fine again.
-	j.has_bmm_accept = true;
+	// With the accepts loaded, the types that carry them are fine again.
+	j.bmm_accepts = 2;
 	datum_test(datum_job_coinbase_is_safe(&j, 4));
 	datum_test(!datum_job_coinbase_is_safe(&j, 1));
+	// Three bids and two accepts: one bid goes unanswered, so nothing is served.
+	j.bmm_requests = 3;
+	datum_test(!datum_job_coinbase_is_safe(&j, 4));
+	j.bmm_requests = 2;
+	datum_test(datum_job_coinbase_is_safe(&j, 4));
 	printf("  a coinbase that dropped a BMM accept is not served\n");
 }
 

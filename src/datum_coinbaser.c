@@ -216,7 +216,7 @@ static int commitment_bytes(const T_DATUM_TXN_COMMITMENT *c) {
 	return 8 + (c->output_script_len < 0xFD ? 1 : 3) + c->output_script_len;
 }
 
-bool datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use, int *count, int *size) {
+int datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use, int *count, int *size) {
 	// Written as hex into coinb2, which has a size of its own.
 	const int hex_room = (STRATUM_COINBASE2_MAX_LEN - 1024) / 2;
 	if (budget > hex_room) budget = hex_room;
@@ -232,14 +232,14 @@ bool datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use,
 	}
 	// The accepts all go in, or none: one left out with its bid in the block
 	// is as bad as all of them, and the job is then not served on this type.
-	bool carried = (accepts == 0);
+	int carried = 0;
 	if (accepts > 0 && accepts_size <= budget) {
 		for (int k = 0; k < s->commitments_count; k++) {
 			if (commitment_rank(s->commitments[k].output_script, s->commitments[k].output_script_len) == 0) use[k] = true;
 		}
 		*count = accepts;
 		*size = accepts_size;
-		carried = true;
+		carried = accepts;
 	}
 	// Then each of the others in rank order, while it fits. One that does not
 	// is a vote, an ack or a proposal this block does not make, which is legal.
@@ -290,7 +290,7 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// every block with a bid once the set outgrew its coinbase.
 	bool use[DATUM_MAX_COMMITMENTS];
 	int commit_count = 0, commit_size = 0;
-	s->coinbase[coinbase_index].carries_accepts = datum_commitments_pack(s, remaining_size, use, &commit_count, &commit_size);
+	s->coinbase[coinbase_index].accepts = datum_commitments_pack(s, remaining_size, use, &commit_count, &commit_size);
 	if (commit_count < s->commitments_count) {
 		// Once per change, not once per job: a job is built every few
 		// seconds and this condition can hold for a whole template.
@@ -299,7 +299,7 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 			warned_size[coinbase_index] = s->commitments_size;
 			DLOG_WARN("Coinbase type %d carries %d of %d commitment(s) (%d of %d bytes) in a %d byte budget%s",
 			          coinbase_index, commit_count, s->commitments_count, commit_size, s->commitments_size, remaining_size,
-			          s->coinbase[coinbase_index].carries_accepts ? "" : "; its BMM accepts did not fit, so this type gets empty work");
+			          s->coinbase[coinbase_index].accepts == s->bmm_accepts ? "" : "; its BMM accepts did not fit, so this type gets empty work");
 		}
 	}
 	i -= commit_size;
@@ -489,7 +489,7 @@ static void build_plain_coinbase(T_DATUM_STRATUM_JOB *s, bool space_for_en_in_co
 	int commit_count = 0, commit_size = 0;
 	// Fixed bytes as for type 1 (see cb_req_sz in generate_coinbase_txns_for_stratum_job).
 	const int req = 119 + s->pool_addr_script_len + cb_input_sz + (space_for_en_in_coinbase ? 0 : 10);
-	s->coinbase[0].carries_accepts = datum_commitments_pack(s, datum_stratum_coinbase_fit_to_template(500, req, s), use, &commit_count, &commit_size);
+	s->coinbase[0].accepts = datum_commitments_pack(s, datum_stratum_coinbase_fit_to_template(500, req, s), use, &commit_count, &commit_size);
 	// Where the subsidy-only coinbase's own output starts in its coinb2.
 	int sub2 = 0;
 	
@@ -638,8 +638,21 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// is after the coinbaser has landed and the commitment set is whatever it
 	// is going to be for this job.
 	//
-	// Each coinbase type says for itself whether it carries the accepts.
+	// Each coinbase type says for itself how many accepts it carries.
 	datum_job_note_bmm_accept(s);
+	// Coinbase 0 and the subsidy-only coinbase were built with the job and
+	// clients may already hold work on them: their bytes never change after
+	// (build_plain_coinbase is not called here). If the pool link changed
+	// since, the coinbase input -- and the PoT byte's place, one index for all
+	// types -- would differ between them and the types built now: the other
+	// types then stay copies of coinbase 0 for this job.
+	if (datum_protocol_is_active() != s->is_datum_job) {
+		DLOG_INFO("Pool link changed since job %d was made; it stays on its plain coinbase", s->global_index);
+		for (int t = 1; t < MAX_COINBASE_TYPES; t++) {
+			memcpy(&s->coinbase[t], &s->coinbase[0], sizeof(s->coinbase[0]));
+		}
+		return;
+	}
 	// Account for available vsize, sigops, size, weight, etc
 	
 	// Note:
@@ -757,14 +770,12 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// we need to know the output count for each type so we can figure out what to stuff in each one
 	// this may be a bit wasteful, but needs to be done.  only needs to happen once per work update, and only when doing non-empty.
 	
-	build_plain_coinbase(s, space_for_en_in_coinbase, cb_input_sz, cb1idx, cb2idx);
-	
 	if (empty_only) {
 		// copy empty coinbaser to the others
 		for (i=1;i<MAX_COINBASE_TYPES;i++) {
 			strcpy(s->coinbase[i].coinb1, s->coinbase[0].coinb1);
 			strcpy(s->coinbase[i].coinb2, s->coinbase[0].coinb2);
-			s->coinbase[i].carries_accepts = s->coinbase[0].carries_accepts;
+			s->coinbase[i].accepts = s->coinbase[0].accepts;
 		}
 	} else {
 		// ok, let's figure out how much space, if any, we have for miner payout outputs
@@ -861,33 +872,34 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 // full coinbase without the accept. The accept is worked out on the side and
 // published with a single store.
 void datum_job_note_bmm_request(T_DATUM_STRATUM_JOB *s) {
-	bool request = false;
+	// Each bid needs its own accept: counted, not just noticed.
+	int requests = 0;
 	if (s->block_template) {
 		for (uint32_t t = 0; t < s->block_template->txn_count; t++) {
 			// Exactly as Chains reads one: see txn_has_bmm_request_output.
 			if (txn_has_bmm_request_output(s->block_template->txns[t].txn_data_binary, s->block_template->txns[t].size)) {
-				request = true;
-				break;
+				requests++;
 			}
 		}
 	}
-	__atomic_store_n(&s->has_bmm_request, request, __ATOMIC_RELEASE);
+	__atomic_store_n(&s->bmm_requests, requests, __ATOMIC_RELEASE);
+	__atomic_store_n(&s->has_bmm_request, requests > 0, __ATOMIC_RELEASE);
 }
 
 void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s) {
 	unsigned char tag[4];
-	bool accept = false;
+	int accepts = 0;
 	for (int i = 0; i < s->commitments_count; i++) {
 		if (datum_commitment_tag(s->commitments[i].output_script, s->commitments[i].output_script_len, tag)
 		    && tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68) {
-			accept = true;
-			break;
+			accepts++;
 		}
 	}
 	// An accept of the template that did not fit: the block's accepts are not
 	// all there, whatever this job carries.
-	if (s->block_template && s->block_template->bmm_accepts_dropped) accept = false;
-	__atomic_store_n(&s->has_bmm_accept, accept, __ATOMIC_RELEASE);
+	if (s->block_template && s->block_template->bmm_accepts_dropped) accepts = 0;
+	__atomic_store_n(&s->bmm_accepts, accepts, __ATOMIC_RELEASE);
+	__atomic_store_n(&s->has_bmm_accept, accepts > 0, __ATOMIC_RELEASE);
 }
 
 // Whether a client on this coinbase type may be served this job.
@@ -903,10 +915,16 @@ bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect) {
 	// A bid in the block and no accept in the job: whatever coinbase is
 	// built, the block is invalid on the drivechain. Only empty work is safe.
 	const bool request = __atomic_load_n(&j->has_bmm_request, __ATOMIC_ACQUIRE);
-	const bool accept = __atomic_load_n(&j->has_bmm_accept, __ATOMIC_ACQUIRE);
-	if (request && !accept) return false;
-	if (!accept) return true;
-	return j->coinbase[cbselect].carries_accepts;
+	const int accepts = __atomic_load_n(&j->bmm_accepts, __ATOMIC_ACQUIRE);
+	if (accepts == 0) return !request;
+	// Chains wants an accept for every bid in the block (each accept answers
+	// one: datum_bmm_accept_answers_a_request); fewer accepts than bids is a
+	// block every node rejects, whatever the coinbase carries.
+	if (accepts < __atomic_load_n(&j->bmm_requests, __ATOMIC_ACQUIRE)) return false;
+	// Every accept the job has now, not only those of the set the coinbase was
+	// built from: coinbase 0 is built when the job is made, and a pool's
+	// accept merged later is not in it.
+	return j->coinbase[cbselect].accepts == accepts;
 }
 
 // OP_RETURN and one push that ends the script: what Chains reads as a message, and nothing that
@@ -1062,6 +1080,35 @@ bool datum_m4_fits_template(const unsigned char *script, int len, const T_DATUM_
 	return false;
 }
 
+// The sidechain slot a per-slot commitment (M2, M3, M7) names: the byte after
+// the tag, wherever the push puts it -- Chains reads PUSHDATA1/2/4 forms too,
+// so a fixed offset let one slot through twice in two encodings. -1 if none.
+static int commitment_slot(const unsigned char *script, int len) {
+	if (!script || len < 2 || script[0] != 0x6a) return -1;
+	int at;
+	if (script[1] <= 0x4b) at = 2;
+	else if (script[1] == 0x4c) at = 3;
+	else if (script[1] == 0x4d) at = 4;
+	else if (script[1] == 0x4e) at = 6;
+	else return -1;
+	at += 4; // the tag
+	return at < len ? script[at] : -1;
+}
+
+bool datum_payout_script_is_standard(const unsigned char *script, int len) {
+	if (!script) return false;
+	// P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+	if (len == 25) return script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac;
+	// P2SH: OP_HASH160 <20> OP_EQUAL
+	if (len == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87) return true;
+	// Segwit: OP_0 <20 or 32>, or OP_1..OP_16 <2..40> (P2TR is OP_1 <32>).
+	if (len >= 4 && len <= 42 && script[1] == len - 2) {
+		if (script[0] == 0x00) return len == 22 || len == 34;
+		if (script[0] >= 0x51 && script[0] <= 0x60) return true;
+	}
+	return false;
+}
+
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free) {
 	// parse raw outputs from DATUM connection into a useful coinbaser
 	uint64_t outval = 0;
@@ -1194,15 +1241,15 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 						DLOG_ERROR("Pool sent a second M4. Dropping it: a block has one.");
 						continue;
 					}
-					if (per_slot && clen > 6) {
+					if (per_slot && commitment_slot(cscript, clen) >= 0) {
 						// Among the pool's own: the template's of the same kind are cleared below,
 						// when the pool's replace them.
 						bool duplicate = false;
 						for (int q = 0; q < pool_kinds_count && !duplicate; q++) {
-							duplicate = !memcmp(pool_kinds[q], tag, 4) && pool_kinds[q][4] == cscript[6];
+							duplicate = !memcmp(pool_kinds[q], tag, 4) && pool_kinds[q][4] == commitment_slot(cscript, clen);
 						}
 						if (duplicate) {
-							DLOG_ERROR("Pool sent a second commitment of one kind for sidechain %d. Dropping it: a block has one.", cscript[6]);
+							DLOG_ERROR("Pool sent a second commitment of one kind for sidechain %d. Dropping it: a block has one.", commitment_slot(cscript, clen));
 							continue;
 						}
 					}
@@ -1296,13 +1343,23 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 				           "carrying it would build a block our node accepts and the enforcer rejects.");
 				continue;
 			}
+			{
+				bool same = false;
+				for (int q = 0; q < s->commitments_count && !same; q++) {
+					same = s->commitments[q].output_script_len == clen && !memcmp(s->commitments[q].output_script, cscript, clen);
+				}
+				if (same) {
+					DLOG_ERROR("Pool sent a commitment the block already carries. Dropping the copy: Chains refuses a block with both.");
+					continue;
+				}
+			}
 			memcpy(s->commitments[s->commitments_count].output_script, cscript, clen);
 			s->commitments[s->commitments_count].output_script_len = clen;
 			{
 				unsigned char kind[4];
-				if (clen > 6 && pool_kinds_count < DATUM_MAX_COMMITMENTS && datum_commitment_tag(cscript, clen, kind)) {
+				if (commitment_slot(cscript, clen) >= 0 && pool_kinds_count < DATUM_MAX_COMMITMENTS && datum_commitment_tag(cscript, clen, kind)) {
 					memcpy(pool_kinds[pool_kinds_count], kind, 4);
-					pool_kinds[pool_kinds_count][4] = cscript[6];
+					pool_kinds[pool_kinds_count][4] = (unsigned char)commitment_slot(cscript, clen);
 					pool_kinds_count++;
 				}
 			}
@@ -1338,6 +1395,15 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			goto fail;
 		}
 		
+		if (!datum_payout_script_is_standard(&coinbaser[cidx], slen)) {
+			// Not a payee's address. On a drivechain the node reads BIP300
+			// messages from every coinbase output whatever its value: an
+			// OP_RETURN or escrow script here bypasses every commitment check
+			// and can make each block invalid. Left out, the rest stands.
+			DLOG_WARN("Pool payout script of %d bytes is not a standard address; left out", slen);
+			cidx += slen;
+			continue;
+		}
 		tally += outval;
 		memcpy(s->available_coinbase_outputs[cbvalid].output_script, &coinbaser[cidx], slen); cidx+=slen;
 		// 64-bit value in sats is part of the output

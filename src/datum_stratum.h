@@ -110,10 +110,12 @@ typedef struct {
 	
 	int coinb1_len;
 	int coinb2_len;
-	// Whether this coinbase carries every BMM accept of the job's commitment
-	// set (datum_commitments_pack). Leaving out a vote, an ack or a proposal
-	// is safe; leaving out an accept is fatal: the block still holds the bid.
-	bool carries_accepts;
+	// How many BMM accepts this coinbase carries (datum_commitments_pack: all
+	// of the set it was built from, or none). It is served only while that is
+	// every accept the job has (bmm_accepts): leaving out a vote, an ack or a
+	// proposal is safe; leaving out an accept is fatal, the block still holds
+	// the bid.
+	int accepts;
 } T_DATUM_STRATUM_COINBASE;
 
 typedef struct {
@@ -161,10 +163,14 @@ typedef struct {
 	// every enforcer rejects -- which is how a pool loses a block and is told
 	// nothing is wrong. See datum_job_coinbase_is_safe.
 	bool has_bmm_accept;
+	// How many BMM accepts the job's commitment set holds now.
+	int bmm_accepts;
 	// Whether this job's block carries a BMM request (M8 bid). A bid with no
 	// accept beside it is the same lost block from the other side: the
 	// accept was never loaded, so no coinbase type can carry it.
 	bool has_bmm_request;
+	// How many BMM requests (bids) the job's block holds.
+	int bmm_requests;
 	unsigned char pool_addr_script[64];
 	int pool_addr_script_len;
 	

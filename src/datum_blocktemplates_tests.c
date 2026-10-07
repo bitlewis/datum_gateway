@@ -574,6 +574,47 @@ static void a_skipped_template_commitment_leaves_no_hole(void) {
 // chosen against the exact transaction set it is about to mine, and every
 // accept shares a tag, so letting the pool's in would drop all of those and
 // substitute somebody else's mempool view.
+static void pool_commitments_follow_chains_rules(void) {
+	static T_DATUM_STRATUM_JOB job;
+	memset(&job, 0, sizeof(job));
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&tpl, 0, sizeof(tpl));
+	tpl.from_enforcer = true;
+	job.block_template = &tpl;
+	job.coinbase_value = 5000000000ULL;
+
+	// Two acks for slot 3, an ack for slot 4, a script that is not one push, and an M4 twice.
+	unsigned char ack3a[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x03 };
+	unsigned char ack3b[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x03 };
+	unsigned char ack4[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x04 };
+	for (int i = 7; i < 39; i++) { ack3a[i] = (unsigned char)i; ack3b[i] = (unsigned char)(i + 1); ack4[i] = (unsigned char)(i + 2); }
+	unsigned char sigops[8] = { 0x6a, 0x02, 0xd6, 0xe1, 0xac, 0xac, 0xac, 0xac };
+	unsigned char m4[8] = { 0x6a, 0x06, 0xd7, 0x7d, 0x17, 0x76, 0x00, 0xff };
+	unsigned char cb[1024];
+	int n = 0;
+	cb[n++] = 0x80 | 0x01;
+	cb[n++] = 6;
+	const unsigned char *scripts[6] = { ack3a, ack3b, ack4, sigops, m4, m4 };
+	const int lens[6] = { 39, 39, 39, 8, 8, 8 };
+	for (int i = 0; i < 6; i++) {
+		cb[n++] = (unsigned char)lens[i]; cb[n++] = 0;
+		memcpy(&cb[n], scripts[i], lens[i]); n += lens[i];
+	}
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+	// One ack per slot, no script with sigops, one M4.
+	int acks3 = 0, acks4 = 0, m4s = 0;
+	for (int c = 0; c < job.commitments_count; c++) {
+		const unsigned char *o = job.commitments[c].output_script;
+		datum_test(datum_script_is_one_push(o, job.commitments[c].output_script_len));
+		if (o[2] == 0xd6 && o[6] == 0x03) acks3++;
+		if (o[2] == 0xd6 && o[6] == 0x04) acks4++;
+		if (o[2] == 0xd7) m4s++;
+	}
+	datum_test(acks3 == 1 && acks4 == 1);
+	datum_test(m4s <= 1);
+	printf("  pool commitments follow Chains' rules: one per kind and slot, one M4, one push each\n");
+}
+
 static void a_malformed_pool_payload_leaves_the_template_whole(void) {
 	static T_DATUM_STRATUM_JOB job;
 	memset(&job, 0, sizeof(job));
@@ -660,12 +701,26 @@ static void a_template_with_its_own_accepts_ignores_the_pools(void) {
 	// transaction's bytes, so the check scans transaction data rather than
 	// txids. Wrapped in filler so the match is found at an offset, not at 0.
 	static T_DATUM_TEMPLATE_TXN txn;
-	static unsigned char m8_bytes[80];
+	// A real one: version, one input, one output whose script is the M8 for slot 9 and the
+	// sidechain block the accept names, then the lock time.
+	static unsigned char m8_bytes[4 + 1 + 36 + 1 + 4 + 1 + 8 + 1 + 70 + 4];
 	memset(&txn, 0, sizeof(txn));
-	memset(m8_bytes, 0x11, sizeof(m8_bytes));
-	memcpy(&m8_bytes[24], &theirs[7], 32);
+	memset(m8_bytes, 0, sizeof(m8_bytes));
+	int k = 0;
+	m8_bytes[k++] = 0x02; k += 3;                         // version
+	m8_bytes[k++] = 0x01; k += 36;                        // one input, its outpoint
+	m8_bytes[k++] = 0x00;                                 // empty script
+	memset(&m8_bytes[k], 0xff, 4); k += 4;                // sequence
+	m8_bytes[k++] = 0x01; k += 8;                         // one output, value 0
+	m8_bytes[k++] = 70;
+	m8_bytes[k++] = 0x6a; m8_bytes[k++] = 0x44;
+	m8_bytes[k++] = 0x00; m8_bytes[k++] = 0xbf; m8_bytes[k++] = 0x00;
+	m8_bytes[k++] = 0x09;                                 // slot
+	memcpy(&m8_bytes[k], &theirs[7], 32); k += 32;        // the sidechain block
+	k += 32;                                              // the previous mainchain block
+	k += 4;                                               // lock time
 	txn.txn_data_binary = m8_bytes;
-	txn.size = sizeof(m8_bytes);
+	txn.size = (uint32_t)k;
 	bare.txns = &txn;
 	bare.txn_count = 1;
 	job.block_template = &bare;
@@ -1057,6 +1112,7 @@ void datum_blocktemplates_tests(void) {
 	the_pool_can_ack_more_than_one_proposal();
 	a_template_with_its_own_accepts_ignores_the_pools();
 	a_malformed_pool_payload_leaves_the_template_whole();
+	pool_commitments_follow_chains_rules();
 	the_output_count_matches_the_outputs_written();
 	an_m4_of_the_wrong_length_is_recognised();
 	the_pool_vote_replaces_the_templates_vote_of_the_same_kind();

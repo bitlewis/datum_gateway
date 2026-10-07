@@ -261,6 +261,8 @@ bool txn_is_bmm_request(const uint8_t *d, uint32_t size);
 // where a false match is expensive; see datum_blocktemplates.c.
 bool txn_has_bmm_request_output(const uint8_t *d, uint32_t size);
 
+const uint8_t *txn_bmm_request_script(const uint8_t *d, uint32_t size);
+bool datum_bmm_accept_answers_a_request(const unsigned char *scr, int slen, const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count);
 bool datum_template_commitment_is_backed(const unsigned char *scr, int slen,
                                          const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count);
 

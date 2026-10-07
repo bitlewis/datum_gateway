@@ -929,6 +929,19 @@ bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect) {
 	return j->coinbase[cbselect].carries_commitments;
 }
 
+// OP_RETURN and one push that ends the script: what Chains reads as a message, and nothing that
+// counts as a signature operation.
+bool datum_script_is_one_push(const unsigned char *script, int len) {
+	if (!script || len < 2 || script[0] != 0x6a) return false;
+	const unsigned char op = script[1];
+	long n, at;
+	if (op <= 0x4b) { n = op; at = 2; }
+	else if (op == 0x4c) { if (len < 3) return false; n = script[2]; at = 3; }
+	else if (op == 0x4d) { if (len < 4) return false; n = script[2] | (script[3] << 8); at = 4; }
+	else return false;
+	return at + n == len;
+}
+
 bool datum_commitment_tag(const unsigned char *script, int len, unsigned char out[4]) {
 	if (!script || len < 2 || script[0] != 0x6a) return false;
 	int i = 1;
@@ -1144,6 +1157,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 		// See datum_commitments_drop_tag: clearing is per tag, not per message.
 		unsigned char cleared[DATUM_MAX_COMMITMENTS][4];
 		int cleared_count = 0;
+		bool pool_m4 = false;
 		for (int ci = 0; ci < ccount; ci++) {
 			if (cidx + 2 > cblen) {
 				DLOG_ERROR("Coinbaser commitment %d has no length. Using default/empty", ci);
@@ -1180,6 +1194,45 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 			// agree with it about how many sidechains there are. If it does
 			// not, the template's stands. A vote not cast costs one block's
 			// worth of influence; a vote cast wrongly costs the block.
+			// What Chains takes per block, checked before anything is carried: a block
+			// breaking one of these rules is one every node rejects.
+			{
+				unsigned char tag[4];
+				if (!datum_script_is_one_push(cscript, clen)) {
+					DLOG_ERROR("Pool sent a commitment that is not OP_RETURN and one push. Dropping it.");
+					continue;
+				}
+				if (datum_commitment_tag(cscript, clen, tag)) {
+					const bool is_m4 = tag[0] == 0xd7 && tag[1] == 0x7d && tag[2] == 0x17 && tag[3] == 0x76;
+					const bool per_slot = (tag[0] == 0xd6 && tag[1] == 0xe1 && tag[2] == 0xc5 && tag[3] == 0xdf)  // M2
+					                   || (tag[0] == 0xd4 && tag[1] == 0x5a && tag[2] == 0xa9 && tag[3] == 0x43)  // M3
+					                   || (tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68); // M7
+					if (is_m4 && pool_m4) {
+						DLOG_ERROR("Pool sent a second M4. Dropping it: a block has one.");
+						continue;
+					}
+					if (per_slot && clen > 6) {
+						bool duplicate = false;
+						for (int q = 0; q < s->commitments_count && !duplicate; q++) {
+							unsigned char other[4];
+							const unsigned char *o = s->commitments[q].output_script;
+							const int olen = s->commitments[q].output_script_len;
+							duplicate = olen > 6 && datum_commitment_tag(o, olen, other) && !memcmp(other, tag, 4) && o[6] == cscript[6];
+						}
+						if (duplicate) {
+							DLOG_ERROR("Pool sent a second commitment of one kind for sidechain %d. Dropping it: a block has one.", cscript[6]);
+							continue;
+						}
+					}
+					if (tag[0] == 0xd1 && tag[1] == 0x61 && tag[2] == 0x73 && tag[3] == 0x68 &&
+					    !datum_bmm_accept_answers_a_request(cscript, clen, s->block_template ? s->block_template->txns : NULL,
+					                                        s->block_template ? s->block_template->txn_count : 0)) {
+						DLOG_ERROR("Pool sent a BMM accept with no request in our block for that sidechain and block. Dropping it.");
+						continue;
+					}
+					if (is_m4) pool_m4 = true;
+				}
+			}
 			{
 				unsigned char tag[4];
 				if (datum_commitment_tag(cscript, clen, tag)

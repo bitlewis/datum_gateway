@@ -1693,6 +1693,14 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 		}
 		new_block = true;
 		// An empty job is a new job, not the same job at a new difficulty.
+		if (quickdiff) {
+			// The targets above were set for a quick difficulty change: set them as for a new job,
+			// or the coinbase rebuilt for its shares would have the old difficulty's PoT byte, and
+			// every share -- and a block found on it -- would fail.
+			get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_diff);
+			m->stratum_job_diffs[j->global_index] = m->last_sent_diff;
+			m->quickdiff_active = false;
+		}
 		quickdiff = false;
 	}
 	

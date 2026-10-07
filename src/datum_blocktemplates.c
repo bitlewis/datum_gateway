@@ -182,6 +182,40 @@ static bool txn_varint(const uint8_t *d, uint32_t size, uint32_t *p, uint64_t *o
 //
 // A transaction this cannot read falls back to the scan, which has never missed
 // a bid. A template's transactions are always readable, so that is a guard.
+// The BMM request (M8) of a transaction: its output 0, as Chains reads it (OP_RETURN, a push of 68
+// bytes, 00bf00, the slot, the sidechain block, the previous mainchain block). NULL if it has none.
+const uint8_t *txn_bmm_request_script(const uint8_t *d, uint32_t size) {
+	uint32_t p = 4; // version
+	uint64_t n, len;
+	if (!d || size < 10) return NULL;
+	if (d[4] == 0x00 && d[5] == 0x01) p = 6;
+	if (!txn_varint(d, size, &p, &n)) return NULL;
+	for (uint64_t i = 0; i < n; i++) {
+		if ((uint64_t)p + 36 > size) return NULL;
+		p += 36;
+		if (!txn_varint(d, size, &p, &len) || (uint64_t)p + len + 4 > size) return NULL;
+		p += (uint32_t)len + 4;
+	}
+	if (!txn_varint(d, size, &p, &n) || n == 0) return NULL;
+	if ((uint64_t)p + 8 > size) return NULL;
+	p += 8;
+	if (!txn_varint(d, size, &p, &len) || (uint64_t)p + len > size) return NULL;
+	const uint8_t *s = &d[p];
+	if (len == 70 && s[0] == 0x6a && s[1] == 0x44 && s[2] == 0x00 && s[3] == 0xbf && s[4] == 0x00) return s;
+	return NULL;
+}
+
+// Whether a BMM accept (M7: OP_RETURN, a push of 37 bytes, the tag, the slot, the sidechain block)
+// answers a request in the block for exactly that slot and that sidechain block.
+bool datum_bmm_accept_answers_a_request(const unsigned char *scr, int slen, const T_DATUM_TEMPLATE_TXN *txns, uint32_t txn_count) {
+	if (slen != 39 || scr[0] != 0x6a || scr[1] != 0x25) return false;
+	for (uint32_t t = 0; t < txn_count; t++) {
+		const uint8_t *s = txn_bmm_request_script(txns[t].txn_data_binary, txns[t].size);
+		if (s && s[5] == scr[6] && !memcmp(&s[6], &scr[7], 32)) return true;
+	}
+	return false;
+}
+
 bool txn_has_bmm_request_output(const uint8_t *d, uint32_t size) {
 	uint32_t p = 4; // version
 	uint64_t n, len;

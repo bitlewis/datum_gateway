@@ -45,6 +45,7 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 // The 4-byte BIP300 message tag a commitment carries, or false if the script is
 // not shaped like one. Exposed for the tests: which tag a commitment holds is
 // what decides whether the pool's vote replaces it.
+bool datum_script_is_one_push(const unsigned char *script, int len);
 bool datum_commitment_tag(const unsigned char *script, int len, unsigned char out[4]);
 
 // Drop every commitment on the job carrying this tag, keeping the rest.

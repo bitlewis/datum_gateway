@@ -1542,6 +1542,7 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 						int t = datum_stratum_coinbase_type_by_name(tok + 3);
 						if (t > 0) {
 							m->coinbase_selection = t;
+							m->coinbase_chosen = true;
 							DLOG_INFO("client %s chose coinbase type %d from its password", m->useragent, t);
 						} else {
 							DLOG_WARN("client %s asked for coinbase type \"%s\", which is not one; keeping %d", m->useragent, tok + 3, m->coinbase_selection);
@@ -1923,8 +1924,9 @@ int client_mining_subscribe(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	if (m->forced_high_min_diff > m->current_diff) m->current_diff = m->forced_high_min_diff;
 	
 	// default to the antminer workaround, which appears to be universally compatible
-	// except for NiceHash.
-	m->coinbase_selection = 2;
+	// except for NiceHash. A client that authorised before it subscribed may have
+	// chosen its type in its password already: that stays.
+	if (!m->coinbase_chosen) m->coinbase_selection = 2;
 	
 	m->useragent[0] = 0;
 	if (params_obj) {
@@ -1938,7 +1940,9 @@ int client_mining_subscribe(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	}
 	
 	if ((datum_config.stratum_v1_fingerprint_miners) && (m->useragent[0])) {
+		const unsigned char chosen_type = m->coinbase_selection;
 		datum_stratum_fingerprint_by_UA(m);
+		if (m->coinbase_chosen) m->coinbase_selection = chosen_type;
 		if (m->current_diff < datum_config.stratum_v1_vardiff_min) {
 			m->current_diff = datum_config.stratum_v1_vardiff_min;
 		}

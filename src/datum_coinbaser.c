@@ -1322,6 +1322,9 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 	// per bad coinbaser.
 fail:
 	s->available_coinbase_outputs_count = 0;
+	// The pool's commitments may be half merged by now, with template votes of their kind already
+	// dropped: back to the template's own, whole, as if the pool had sent nothing.
+	commitments_from_template(s);
 	if (must_free) free(coinbaser);
 	return 0;
 }

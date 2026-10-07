@@ -260,6 +260,8 @@ typedef struct {
 	uint64_t stratum_job_diffs[MAX_STRATUM_JOBS];
 	
 	unsigned char coinbase_selection;
+	// The client chose its coinbase type itself (cb= in its password): kept over defaults and fingerprints.
+	bool coinbase_chosen;
 	
 	uint64_t share_diff_accepted;
 	uint64_t share_count_accepted;

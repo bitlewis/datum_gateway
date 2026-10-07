@@ -574,6 +574,42 @@ static void a_skipped_template_commitment_leaves_no_hole(void) {
 // chosen against the exact transaction set it is about to mine, and every
 // accept shares a tag, so letting the pool's in would drop all of those and
 // substitute somebody else's mempool view.
+static void a_malformed_pool_payload_leaves_the_template_whole(void) {
+	static T_DATUM_STRATUM_JOB job;
+	memset(&job, 0, sizeof(job));
+	// The template acks a sidechain proposal (M2).
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&tpl, 0, sizeof(tpl));
+	unsigned char ack[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x03 };
+	for (int i = 7; i < 39; i++) ack[i] = (unsigned char)(i * 5);
+	memcpy(tpl.commitments[0].output_script, ack, sizeof(ack));
+	tpl.commitments[0].output_script_len = sizeof(ack);
+	tpl.commitments_count = 1;
+	tpl.from_enforcer = true;
+	job.block_template = &tpl;
+	job.coinbase_value = 5000000000ULL;
+
+	// The pool sends an ack of its own, which replaces the template's acks, and
+	// then a second commitment cut short: the whole payload is refused.
+	unsigned char theirs[39] = { 0x6a, 0x25, 0xd6, 0xe1, 0xc5, 0xdf, 0x04 };
+	for (int i = 7; i < 39; i++) theirs[i] = (unsigned char)(i * 11);
+	unsigned char cb[512];
+	int n = 0;
+	cb[n++] = 0x80 | 0x01;
+	cb[n++] = 0x02;                                                    // two commitments
+	cb[n++] = (unsigned char)sizeof(theirs); cb[n++] = 0x00;
+	memcpy(&cb[n], theirs, sizeof(theirs)); n += sizeof(theirs);
+	cb[n++] = 50; cb[n++] = 0x00;                                      // 50 bytes promised...
+	cb[n++] = 0x6a;                                                    // ...one given
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+
+	// Not half of it: the template's own ack, whole, and no pool payouts.
+	datum_test(job.available_coinbase_outputs_count == 0);
+	datum_test(job.commitments_count == 1);
+	datum_test(job.commitments[0].output_script[6] == 0x03);
+	printf("  a malformed pool payload leaves the template's commitments whole\n");
+}
+
 static void a_template_with_its_own_accepts_ignores_the_pools(void) {
 	static T_DATUM_STRATUM_JOB job;
 	memset(&job, 0, sizeof(job));
@@ -1020,6 +1056,7 @@ void datum_blocktemplates_tests(void) {
 	dropping_a_bid_rewrites_the_witness_commitment();
 	the_pool_can_ack_more_than_one_proposal();
 	a_template_with_its_own_accepts_ignores_the_pools();
+	a_malformed_pool_payload_leaves_the_template_whole();
 	the_output_count_matches_the_outputs_written();
 	an_m4_of_the_wrong_length_is_recognised();
 	the_pool_vote_replaces_the_templates_vote_of_the_same_kind();

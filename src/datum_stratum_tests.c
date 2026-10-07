@@ -210,13 +210,13 @@ static void a_dropped_bmm_accept_makes_a_coinbase_unservable(void) {
 
 	// Votes only: a type that could not fit them abstains, which is legal.
 	j.has_bmm_accept = false;
-	j.coinbase[1].carries_commitments = false;
-	j.coinbase[4].carries_commitments = true;
+	j.coinbase[1].carries_accepts = false;
+	j.coinbase[4].carries_accepts = true;
 	datum_test(datum_job_coinbase_is_safe(&j, 1));
 	datum_test(datum_job_coinbase_is_safe(&j, 4));
 
-	// One of them is an accept: only a type that carries the whole set may be
-	// served, and coinbase 0 never carries one.
+	// One of them is an accept: only a type that carries the accepts may be
+	// served.
 	j.has_bmm_accept = true;
 	datum_test(!datum_job_coinbase_is_safe(&j, 1));
 	datum_test(datum_job_coinbase_is_safe(&j, 4));

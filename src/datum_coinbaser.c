@@ -190,6 +190,72 @@ int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
 	return cb_input_sz;
 }
 
+// Where a commitment ranks when a coinbase cannot carry them all: by what is
+// lost without it. A BMM accept (M7) answers a bid that is a transaction of
+// the same block, which without it is invalid on the drivechain; then a vote
+// (M4), an ack (M2), a bundle (M3), a proposal (M1), and anything else.
+static int commitment_rank(const unsigned char *script, int len) {
+	static const unsigned char tags[5][4] = {
+		{ 0xd1, 0x61, 0x73, 0x68 }, // M7, BMM accept
+		{ 0xd7, 0x7d, 0x17, 0x76 }, // M4, vote on bundles
+		{ 0xd6, 0xe1, 0xc5, 0xdf }, // M2, ack of a proposed sidechain
+		{ 0xd4, 0x5a, 0xa9, 0x43 }, // M3, bundle
+		{ 0xd5, 0xe0, 0xc4, 0xaf }, // M1, sidechain proposal
+	};
+	unsigned char tag[4];
+	if (datum_commitment_tag(script, len, tag)) {
+		for (int r = 0; r < 5; r++) {
+			if (!memcmp(tag, tags[r], 4)) return r;
+		}
+	}
+	return 5;
+}
+
+static int commitment_bytes(const T_DATUM_TXN_COMMITMENT *c) {
+	// 8 bytes of value, the script's length prefix, then the script.
+	return 8 + (c->output_script_len < 0xFD ? 1 : 3) + c->output_script_len;
+}
+
+bool datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use, int *count, int *size) {
+	// Written as hex into coinb2, which has a size of its own.
+	const int hex_room = (STRATUM_COINBASE2_MAX_LEN - 1024) / 2;
+	if (budget > hex_room) budget = hex_room;
+	*count = 0;
+	*size = 0;
+	int accepts = 0, accepts_size = 0;
+	for (int k = 0; k < s->commitments_count; k++) {
+		use[k] = false;
+		if (commitment_rank(s->commitments[k].output_script, s->commitments[k].output_script_len) == 0) {
+			accepts++;
+			accepts_size += commitment_bytes(&s->commitments[k]);
+		}
+	}
+	// The accepts all go in, or none: one left out with its bid in the block
+	// is as bad as all of them, and the job is then not served on this type.
+	bool carried = (accepts == 0);
+	if (accepts > 0 && accepts_size <= budget) {
+		for (int k = 0; k < s->commitments_count; k++) {
+			if (commitment_rank(s->commitments[k].output_script, s->commitments[k].output_script_len) == 0) use[k] = true;
+		}
+		*count = accepts;
+		*size = accepts_size;
+		carried = true;
+	}
+	// Then each of the others in rank order, while it fits. One that does not
+	// is a vote, an ack or a proposal this block does not make, which is legal.
+	for (int r = 1; r <= 5; r++) {
+		for (int k = 0; k < s->commitments_count; k++) {
+			if (commitment_rank(s->commitments[k].output_script, s->commitments[k].output_script_len) != r) continue;
+			const int b = commitment_bytes(&s->commitments[k]);
+			if (*size + b > budget) continue;
+			use[k] = true;
+			(*count)++;
+			*size += b;
+		}
+	}
+	return carried;
+}
+
 void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s, int coinbase_index, int remaining_size, bool space_for_en_in_coinbase, int *cb1idx, int *cb2idx, bool special_coinb1) {
 	// This function finishes off the stratum coinb1+coinb2 using the available outputs in the job and other flags specified.
 	// it does not attempt to maximize coinb1's size to any specific size
@@ -217,33 +283,27 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// commitment displaced one, the coinbase declared fewer outputs than it
 	// carried. That is an invalid block the gateway believes it found.
 	//
-	// All or nothing. A commitment set that does not fit this coinbase type
-	// is left out of it entirely: a low-capacity rig then mines a block that
-	// abstains, which is legal, rather than one larger than it said it could
-	// carry, which it will not mine at all.
+	// As many as fit, by rank (datum_commitments_pack): every BMM accept or
+	// none, then votes, acks, bundles and proposals. A low-capacity rig then
+	// mines a block that carries the accepts and abstains on what did not fit,
+	// rather than, as when the set went in whole or not at all, empty work for
+	// every block with a bid once the set outgrew its coinbase.
+	bool use[DATUM_MAX_COMMITMENTS];
 	int commit_count = 0, commit_size = 0;
-	// Assume the worst until the budget says otherwise: a type that drops the
-	// set is one this job must not be mined on when an accept is among them.
-	s->coinbase[coinbase_index].carries_commitments = (s->commitments_count == 0);
-	if (s->commitments_count > 0) {
-		if (s->commitments_size <= remaining_size &&
-		    (s->commitments_size * 2) + 1024 <= STRATUM_COINBASE2_MAX_LEN) {
-			commit_count = s->commitments_count;
-			commit_size = s->commitments_size;
-			s->coinbase[coinbase_index].carries_commitments = true;
-		} else {
-			// Once per change, not once per job: a job is built every few
-			// seconds and this condition can hold for a whole template.
-			static int warned_size[MAX_COINBASE_TYPES];
-			if (warned_size[coinbase_index] != s->commitments_size) {
-				warned_size[coinbase_index] = s->commitments_size;
-				DLOG_WARN("Coinbase type %d cannot carry %d commitment(s) (%d bytes) in a %d byte budget; this type mines without them",
-				          coinbase_index, s->commitments_count, s->commitments_size, remaining_size);
-			}
+	s->coinbase[coinbase_index].carries_accepts = datum_commitments_pack(s, remaining_size, use, &commit_count, &commit_size);
+	if (commit_count < s->commitments_count) {
+		// Once per change, not once per job: a job is built every few
+		// seconds and this condition can hold for a whole template.
+		static int warned_size[MAX_COINBASE_TYPES];
+		if (warned_size[coinbase_index] != s->commitments_size) {
+			warned_size[coinbase_index] = s->commitments_size;
+			DLOG_WARN("Coinbase type %d carries %d of %d commitment(s) (%d of %d bytes) in a %d byte budget%s",
+			          coinbase_index, commit_count, s->commitments_count, commit_size, s->commitments_size, remaining_size,
+			          s->coinbase[coinbase_index].carries_accepts ? "" : "; its BMM accepts did not fit, so this type gets empty work");
 		}
-		i -= commit_size;
-		j -= commit_size;
 	}
+	i -= commit_size;
+	j -= commit_size;
 	if (special_coinb1) {
 		i2 = (300 - cb1idx[coinbase_index])>>1;
 		if (i2 < 0) i2 = 0;
@@ -337,7 +397,8 @@ void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s
 	// The bytes are the pool's, verbatim. Nothing here parses or validates
 	// them: a gateway that understood BIP300 would need rebuilding every time
 	// BIP300 gained a message, and the pool is the end that already knows.
-	for (k = 0; k < commit_count; k++) {
+	for (k = 0; k < s->commitments_count; k++) {
+		if (!use[k]) continue;
 		cb2idx[coinbase_index] += sprintf(&s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]], "0000000000000000");
 		cb2idx[coinbase_index] += append_bitcoin_varint_hex(s->commitments[k].output_script_len, &s->coinbase[coinbase_index].coinb2[cb2idx[coinbase_index]]);
 		for (i = 0; i < s->commitments[k].output_script_len; i++) {
@@ -409,11 +470,104 @@ int datum_stratum_coinbase_fit_to_template(int max_sz, int fixed_bytes, T_DATUM_
 	}
 }
 
+// Coinbase 0, the plain one: the pool's (or our) output, the witness
+// commitment, and the commitments that fit the smallest coinbase a client
+// takes (type 1's); and, from the same start, the subsidy-only coinbase of
+// empty work. Every client gets coinbase 0 until the coinbaser has built the
+// others, and for the whole of a job that never runs it: with the
+// commitments in it, that work carries the template's BMM accepts and votes
+// instead of being served empty for every block with a bid.
+//
+// The subsidy-only coinbase is rebuilt with it every time, not only when a
+// job is created: whether the pool is in use decides the coinbase's tags, and
+// so where the PoT byte goes (target_pot_index, set by the caller) and whom
+// it pays. Built from an earlier state, it had the byte in the wrong place.
+static void build_plain_coinbase(T_DATUM_STRATUM_JOB *s, bool space_for_en_in_coinbase, int cb_input_sz, int *cb1idx, int *cb2idx) {
+	T_DATUM_STRATUM_COINBASE *const sub = &s->subsidy_only_coinbase;
+	int i, j = 0, k;
+	bool use[DATUM_MAX_COMMITMENTS];
+	int commit_count = 0, commit_size = 0;
+	// Fixed bytes as for type 1 (see cb_req_sz in generate_coinbase_txns_for_stratum_job).
+	const int req = 119 + s->pool_addr_script_len + cb_input_sz + (space_for_en_in_coinbase ? 0 : 10);
+	s->coinbase[0].carries_accepts = datum_commitments_pack(s, datum_stratum_coinbase_fit_to_template(500, req, s), use, &commit_count, &commit_size);
+	// Where the subsidy-only coinbase's own output starts in its coinb2.
+	int sub2 = 0;
+	
+	if (space_for_en_in_coinbase) {
+		// we'll start the empty coinb2 with the "sequence"
+		pk_u64le(s->coinbase[0].coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
+		cb2idx[0] = 8;
+		cb2idx[0] += append_bitcoin_varint_hex(1 + witness_outputs(s) + commit_count, &s->coinbase[0].coinb2[cb2idx[0]]); // us, witness commit, commitments
+		
+		// copy the beginning to the subsidy-only, its end of string too
+		memcpy(&sub->coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0] + 1);
+		pk_u64le(sub->coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
+		sub2 = 8 + append_bitcoin_varint_hex(1, &sub->coinb2[8]); // just us!
+	} else {
+		// we're already at the point in coinb1 where we need an output count
+		j = cb1idx[0];
+		cb1idx[0] += append_bitcoin_varint_hex(2 + witness_outputs(s) + commit_count, &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, witness commit, commitments
+		
+		// append extranonce op_return
+		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "0000000000000000106a0e%04" PRIx16, s->enprefix);
+		
+		// copy the beginning to the subsidy-only, its end of string too
+		memcpy(&sub->coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0] + 1);
+		k = append_bitcoin_varint_hex(2, &sub->coinb1[j]); // extranonce and us
+		sub->coinb1[j+k] = s->coinbase[0].coinb1[j+k];
+		cb2idx[0] = 0;
+		sub2 = 0;
+	}
+	
+	// The commitments, zero value, before our output as in the sized types.
+	for (k = 0; k < s->commitments_count; k++) {
+		if (!use[k]) continue;
+		cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000");
+		cb2idx[0] += append_bitcoin_varint_hex(s->commitments[k].output_script_len, &s->coinbase[0].coinb2[cb2idx[0]]);
+		for (i = 0; i < s->commitments[k].output_script_len; i++) {
+			uchar_to_hex(&s->coinbase[0].coinb2[cb2idx[0]], s->commitments[k].output_script[i]);
+			cb2idx[0] += 2;
+		}
+	}
+	
+	// append our payout output value and script
+	j = cb2idx[0];
+	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "%016llx", (unsigned long long)__builtin_bswap64(s->coinbase_value)); // TODO: Profile a faster way to do this
+	cb2idx[0] += append_bitcoin_varint_hex(s->pool_addr_script_len, &s->coinbase[0].coinb2[cb2idx[0]]); // Append script length
+	for(i=0;i<s->pool_addr_script_len;i++) {
+		uchar_to_hex(&s->coinbase[0].coinb2[cb2idx[0]], s->pool_addr_script[i]);
+		cb2idx[0]+=2;
+	}
+	k = cb2idx[0];
+	
+	// witness commit output costs 46 bytes
+	// append the default_witness_commitment
+	if (witness_outputs(s)) cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
+	// lock time
+	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
+	
+	// The subsidy-only payout: the subsidy for the height, to our output's script, then the lock time.
+	sprintf(&sub->coinb2[sub2], "%016llx", (unsigned long long)__builtin_bswap64(block_reward(s->height))); // subsidy calc for height
+	memcpy(&sub->coinb2[sub2+16], &s->coinbase[0].coinb2[j+16], k-j-16);
+	sprintf(&sub->coinb2[sub2 + (k-j)], "00000000");
+	
+	// prep binary versions
+	T_DATUM_STRATUM_COINBASE *const built[2] = { &s->coinbase[0], sub };
+	for (int b = 0; b < 2; b++) {
+		i = strlen(built[b]->coinb1);
+		built[b]->coinb1_len = 0;
+		for (j = 0; j < i; j += 2) built[b]->coinb1_bin[built[b]->coinb1_len++] = hex2bin_uchar(&built[b]->coinb1[j]);
+		i = strlen(built[b]->coinb2);
+		built[b]->coinb2_len = 0;
+		for (j = 0; j < i; j += 2) built[b]->coinb2_bin[built[b]->coinb2_len++] = hex2bin_uchar(&built[b]->coinb2[j]);
+	}
+}
+
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block) {
-	// The subsidy-only coinbase is built for every job, not only for new-block jobs: a job of
-	// any kind is served as empty work when no coinbase type can carry it safely (see
-	// send_mining_notify), and a coinbase that was never built would make blocks no node accepts.
-	const bool build_subsidy = true;
+	// The subsidy-only coinbase is built for every job (build_plain_coinbase), not only for
+	// new-block jobs: a job of any kind is served as empty work when no coinbase type can carry
+	// it safely (see send_mining_notify), and a coinbase that was never built would make blocks
+	// no node accepts.
 	(void)new_block;
 	char cb[512];
 	int cb_input_sz = 0;
@@ -476,101 +630,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	
 	s->coinbase[0].coinb1[cb1idx[0]] = 0;
 	
-	/////////////////////////////
-	// 0 / EMPTY
-	// empty should be easy. lets start there
-	if (space_for_en_in_coinbase) {
-		// we'll start the empty coinb2 with the "sequence"
-		pk_u64le(s->coinbase[0].coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
-		cb2idx[0] = 8;
-		cb2idx[0] += append_bitcoin_varint_hex(1 + witness_outputs(s), &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
-		
-		if (build_subsidy) {
-			// copy the beginning to the subsidy-only
-			memcpy(&s->subsidy_only_coinbase.coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0]);
-			pk_u64le(s->subsidy_only_coinbase.coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
-			append_bitcoin_varint_hex(1, &s->subsidy_only_coinbase.coinb2[8]); // just us!
-		}
-	} else {
-		// we're already at the point in coinb1 where we need an output count, which will be 3
-		if (build_subsidy) {
-			j = cb1idx[0];
-		}
-		cb1idx[0] += append_bitcoin_varint_hex(2 + witness_outputs(s), &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
-		
-		// append extranonce op_return
-		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "0000000000000000106a0e%04" PRIx16, s->enprefix);
-		
-		if (build_subsidy) {
-			// copy the beginning to the subsidy-only
-			memcpy(&s->subsidy_only_coinbase.coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0]);
-			k = append_bitcoin_varint_hex(2, &s->subsidy_only_coinbase.coinb1[j]); // extranonce and us
-			s->subsidy_only_coinbase.coinb1[j+k] = s->coinbase[0].coinb1[j+k];
-		}
-	}
-	// finish off "empty" coinbase
-	
-	// append our payout output value and script
-	if (build_subsidy) {
-		j = cb2idx[0];
-	}
-	
-	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "%016llx", (unsigned long long)__builtin_bswap64(s->coinbase_value)); // TODO: Profile a faster way to do this
-	cb2idx[0] += append_bitcoin_varint_hex(s->pool_addr_script_len, &s->coinbase[0].coinb2[cb2idx[0]]); // Append script length
-	for(i=0;i<s->pool_addr_script_len;i++) {
-		uchar_to_hex(&s->coinbase[0].coinb2[cb2idx[0]], s->pool_addr_script[i]);
-		cb2idx[0]+=2;
-	}
-	
-	if (build_subsidy) {
-		k = cb2idx[0];
-	}
-	
-	// witness commit output costs 46 bytes
-	// append the default_witness_commitment
-	if (witness_outputs(s)) cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
-	// lock time
-	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
-	
-	if (build_subsidy) {
-		// Append the subsidy-only payout to the subsidy_only_coinbase
-		sprintf(&s->subsidy_only_coinbase.coinb2[j], "%016llx", (unsigned long long)__builtin_bswap64(block_reward(s->height))); // subsidy calc for height
-		memcpy(&s->subsidy_only_coinbase.coinb2[j+16], &s->coinbase[0].coinb2[j+16], k-j-16);
-		sprintf(&s->subsidy_only_coinbase.coinb2[k], "00000000");
-	}
-	
-	// End of 0 / Empty
-	//////////////////////////////
-	
-	// prep binary versions of the coinbase for speeding up later
-	
-	i = strlen(s->coinbase[0].coinb1);
-	s->coinbase[0].coinb1_len = 0;
-	for(j=0;j<i;j+=2) {
-		s->coinbase[0].coinb1_bin[j>>1] = hex2bin_uchar(&s->coinbase[0].coinb1[j]);
-		s->coinbase[0].coinb1_len++;
-	}
-	i = strlen(s->coinbase[0].coinb2);
-	s->coinbase[0].coinb2_len = 0;
-	for(j=0;j<i;j+=2) {
-		s->coinbase[0].coinb2_bin[j>>1] = hex2bin_uchar(&s->coinbase[0].coinb2[j]);
-		s->coinbase[0].coinb2_len++;
-	}
-	
-	if (build_subsidy) {
-		i = strlen(s->subsidy_only_coinbase.coinb1);
-		s->subsidy_only_coinbase.coinb1_len = 0;
-		for(j=0;j<i;j+=2) {
-			s->subsidy_only_coinbase.coinb1_bin[j>>1] = hex2bin_uchar(&s->subsidy_only_coinbase.coinb1[j]);
-			s->subsidy_only_coinbase.coinb1_len++;
-		}
-		i = strlen(s->subsidy_only_coinbase.coinb2);
-		s->subsidy_only_coinbase.coinb2_len = 0;
-		for(j=0;j<i;j+=2) {
-			s->subsidy_only_coinbase.coinb2_bin[j>>1] = hex2bin_uchar(&s->subsidy_only_coinbase.coinb2[j]);
-			s->subsidy_only_coinbase.coinb2_len++;
-		}
-	}
+	build_plain_coinbase(s, space_for_en_in_coinbase, cb_input_sz, cb1idx, cb2idx);
 }
 
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only) {
@@ -578,11 +638,8 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// is after the coinbaser has landed and the commitment set is whatever it
 	// is going to be for this job.
 	//
-	// Coinbase 0 is the plain one -- pool output and witness commitment, no
-	// commitment section -- so it is marked as carrying nothing before the
-	// sized types below decide for themselves.
+	// Each coinbase type says for itself whether it carries the accepts.
 	datum_job_note_bmm_accept(s);
-	s->coinbase[0].carries_commitments = (s->commitments_count == 0);
 	// Account for available vsize, sigops, size, weight, etc
 	
 	// Note:
@@ -700,77 +757,14 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// we need to know the output count for each type so we can figure out what to stuff in each one
 	// this may be a bit wasteful, but needs to be done.  only needs to happen once per work update, and only when doing non-empty.
 	
-	/////////////////////////////
-	// 0 / EMPTY
-	// empty should be easy. lets start there
-	if (space_for_en_in_coinbase) {
-		// we'll start the empty coinb2 with the "sequence"
-		pk_u64le(s->coinbase[0].coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
-		cb2idx[0] = 8;
-		cb2idx[0] += append_bitcoin_varint_hex(1 + witness_outputs(s), &s->coinbase[0].coinb2[cb2idx[0]]); // us and witness commit
-		
-		if (empty_only) {
-			// copy the beginning to the subsidy-only
-			memcpy(&s->subsidy_only_coinbase.coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0]);
-			pk_u64le(s->subsidy_only_coinbase.coinb2, 0, 0x6666666666666666ULL);  // "ffffffff"
-			append_bitcoin_varint_hex(1, &s->subsidy_only_coinbase.coinb2[8]); // just us!
-		}
-	} else {
-		// we're already at the point in coinb1 where we need an output count, which will be 3
-		if (empty_only) {
-			j = cb1idx[0];
-		}
-		cb1idx[0] += append_bitcoin_varint_hex(2 + witness_outputs(s), &s->coinbase[0].coinb1[cb1idx[0]]); // extranonce, us, and witness commit
-		
-		// append extranonce op_return
-		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "0000000000000000106a0e%04" PRIx16, s->enprefix);
-		
-		if (empty_only) {
-			// copy the beginning to the subsidy-only
-			memcpy(&s->subsidy_only_coinbase.coinb1[0], &s->coinbase[0].coinb1[0], cb1idx[0]);
-			k = append_bitcoin_varint_hex(2, &s->subsidy_only_coinbase.coinb1[j]); // extranonce and us
-			s->subsidy_only_coinbase.coinb1[j+k] = s->coinbase[0].coinb1[j+k];
-		}
-	}
-	// finish off "empty" coinbase
-	
-	// append our payout output value and script
-	if (empty_only) {
-		j = cb2idx[0];
-	}
-	
-	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "%016llx", (unsigned long long)__builtin_bswap64(s->coinbase_value)); // TODO: Profile a faster way to do this
-	cb2idx[0] += append_bitcoin_varint_hex(s->pool_addr_script_len, &s->coinbase[0].coinb2[cb2idx[0]]); // Append script length
-	for(i=0;i<s->pool_addr_script_len;i++) {
-		uchar_to_hex(&s->coinbase[0].coinb2[cb2idx[0]], s->pool_addr_script[i]);
-		cb2idx[0]+=2;
-	}
-	
-	if (empty_only) {
-		k = cb2idx[0];
-	}
-	
-	// witness commit output costs 46 bytes
-	// append the default_witness_commitment
-	if (witness_outputs(s)) cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "0000000000000000%2.2x%s", (unsigned int)strlen(s->block_template->default_witness_commitment)>>1, s->block_template->default_witness_commitment);
-	// lock time
-	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
-	
-	if (empty_only) {
-		// Append the subsidy-only payout to the subsidy_only_coinbase
-		sprintf(&s->subsidy_only_coinbase.coinb2[j], "%016llx", (unsigned long long)__builtin_bswap64(block_reward(s->height))); // subsidy calc for height
-		memcpy(&s->subsidy_only_coinbase.coinb2[j+16], &s->coinbase[0].coinb2[j+16], k-j-16);
-		sprintf(&s->subsidy_only_coinbase.coinb2[k], "00000000");
-	}
-	
-	// End of 0 / Empty
-	//////////////////////////////
+	build_plain_coinbase(s, space_for_en_in_coinbase, cb_input_sz, cb1idx, cb2idx);
 	
 	if (empty_only) {
 		// copy empty coinbaser to the others
 		for (i=1;i<MAX_COINBASE_TYPES;i++) {
 			strcpy(s->coinbase[i].coinb1, s->coinbase[0].coinb1);
 			strcpy(s->coinbase[i].coinb2, s->coinbase[0].coinb2);
+			s->coinbase[i].carries_accepts = s->coinbase[0].carries_accepts;
 		}
 	} else {
 		// ok, let's figure out how much space, if any, we have for miner payout outputs
@@ -835,20 +829,6 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		}
 	}
 	
-	if (empty_only) {
-		i = strlen(s->subsidy_only_coinbase.coinb1);
-		s->subsidy_only_coinbase.coinb1_len = 0;
-		for(j=0;j<i;j+=2) {
-			s->subsidy_only_coinbase.coinb1_bin[j>>1] = hex2bin_uchar(&s->subsidy_only_coinbase.coinb1[j]);
-			s->subsidy_only_coinbase.coinb1_len++;
-		}
-		i = strlen(s->subsidy_only_coinbase.coinb2);
-		s->subsidy_only_coinbase.coinb2_len = 0;
-		for(j=0;j<i;j+=2) {
-			s->subsidy_only_coinbase.coinb2_bin[j>>1] = hex2bin_uchar(&s->subsidy_only_coinbase.coinb2[j]);
-			s->subsidy_only_coinbase.coinb2_len++;
-		}
-	}
 }
 
 // Seed a job's commitments from its template.
@@ -926,7 +906,7 @@ bool datum_job_coinbase_is_safe(const T_DATUM_STRATUM_JOB *j, int cbselect) {
 	const bool accept = __atomic_load_n(&j->has_bmm_accept, __ATOMIC_ACQUIRE);
 	if (request && !accept) return false;
 	if (!accept) return true;
-	return j->coinbase[cbselect].carries_commitments;
+	return j->coinbase[cbselect].carries_accepts;
 }
 
 // OP_RETURN and one push that ends the script: what Chains reads as a message, and nothing that
@@ -988,7 +968,7 @@ void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[
 	s->commitments_count = kept;
 }
 
-static int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
+int commitments_from_template(T_DATUM_STRATUM_JOB *s) {
 	s->commitments_count = 0;
 	s->commitments_size = 0;
 	if (!s->block_template || s->block_template->commitments_count <= 0) return 0;

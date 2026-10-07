@@ -2274,7 +2274,12 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	// Whether the block carries a BMM request, from the start: until the coinbaser has loaded the
 	// commitments (and with them the accept), a job whose block has a request must not be served
 	// as a block (see datum_job_coinbase_is_safe), however long the coinbaser takes, or if it fails.
+	//
+	// The template's own commitments go in from the start too, in coinbase 0 as far as they fit:
+	// that is the work every client gets until the coinbaser lands, and for the whole of a job that
+	// never runs it. Without them it was empty work for every block with a bid, and no votes.
 	s->commitments_count = 0;
+	commitments_from_template(s);
 	datum_job_note_bmm_request(s);
 	datum_job_note_bmm_accept(s);
 	

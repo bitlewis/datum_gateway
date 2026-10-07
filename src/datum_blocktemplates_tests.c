@@ -35,6 +35,7 @@
 #include "datum_stratum.h"
 #include "datum_utils.h"
 #include "datum_coinbaser.h"
+#include "datum_conf.h"
 
 // Build a coinbase transaction hex from a list of (value, scriptPubKey) pairs.
 // Segwit-serialised with a single input, which is what a template server sends.
@@ -510,10 +511,10 @@ static void the_output_count_matches_the_outputs_written(void) {
 	datum_test(mismatches == 0);
 	printf("  the coinbase declares exactly the outputs it carries at every budget (%d mismatched)\n", mismatches);
 
-	// A commitment set too large for the type is left out whole, not truncated
-	// into a count that no longer matches.
-	job.commitments_size = 400;
-	job.commitments[0].output_script_len = 60;
+	// A commitment too large for the type is left out, not truncated into a
+	// count that no longer matches.
+	job.commitments[0].output_script_len = 300;
+	job.commitments_size = 8 + 3 + 300;
 	{
 		int cb1idx[MAX_COINBASE_TYPES] = { 0 }, cb2idx[MAX_COINBASE_TYPES] = { 0 };
 		job.coinbase[1].coinb2[0] = 0;
@@ -524,7 +525,7 @@ static void the_output_count_matches_the_outputs_written(void) {
 		datum_test(trailing == 4);
 		datum_test(strstr(job.coinbase[1].coinb2, "d77d1776") == NULL);
 	}
-	printf("  a commitment set that does not fit a type is left out of it whole\n");
+	printf("  a commitment that does not fit a type is left out of it\n");
 }
 
 // A commitment the template parser skips must not leave a hole behind.
@@ -1125,6 +1126,139 @@ static void a_bid_is_read_from_the_outputs_not_from_a_hash(void) {
 	printf("  a bid is read from the outputs, not from a hash that looks like one\n");
 }
 
+
+static void put_commitment(T_DATUM_STRATUM_JOB *job, const char *hex) {
+	T_DATUM_TXN_COMMITMENT *c = &job->commitments[job->commitments_count++];
+	const int n = strlen(hex) / 2;
+	for (int i = 0; i < n; i++) c->output_script[i] = hex2bin_uchar(&hex[i * 2]);
+	c->output_script_len = n;
+	job->commitments_size += 8 + (n < 0xFD ? 1 : 3) + n;
+}
+
+// An M1 proposal: OP_RETURN, PUSHDATA2 of 1,350 bytes, tag d5e0c4af.
+static void put_proposal(T_DATUM_STRATUM_JOB *job) {
+	T_DATUM_TXN_COMMITMENT *c = &job->commitments[job->commitments_count++];
+	const int body = 1350;
+	c->output_script[0] = 0x6a; c->output_script[1] = 0x4d;
+	c->output_script[2] = body & 0xff; c->output_script[3] = body >> 8;
+	c->output_script[4] = 0xd5; c->output_script[5] = 0xe0; c->output_script[6] = 0xc4; c->output_script[7] = 0xaf;
+	memset(&c->output_script[8], 0x11, body - 4);
+	c->output_script_len = 4 + body;
+	job->commitments_size += 8 + 3 + c->output_script_len;
+}
+
+#define HEX_M7 "6a24d1617368" "0202020202020202020202020202020202020202020202020202020202020202"
+#define HEX_M7B "6a24d1617368" "0303030303030303030303030303030303030303030303030303030303030303"
+#define HEX_M4 "6a07d77d17760100ff"
+#define HEX_M2 "6a24d6e1c5df" "0404040404040404040404040404040404040404040404040404040404040404"
+
+// A small coinbase used to take a commitment set whole or not at all: one
+// proposal in the set, or enough acks, and the accepts went with it, so every
+// client on that type got empty work for every block with a bid. Now the
+// accepts go first, all of them or none, then votes, acks, bundles and
+// proposals while they fit.
+static void commitments_are_packed_by_rank(void) {
+	static T_DATUM_STRATUM_JOB job;
+	memset(&job, 0, sizeof(job));
+	put_proposal(&job);               // 0: M1, 1,361 bytes
+	put_commitment(&job, HEX_M2);     // 1: M2, 47
+	put_commitment(&job, HEX_M7);     // 2: M7, 47
+	put_commitment(&job, HEX_M4);     // 3: M4, 18
+	put_commitment(&job, HEX_M7B);    // 4: M7, 47
+	bool use[DATUM_MAX_COMMITMENTS];
+	int count, size;
+
+	// Room for the accepts, the vote and the ack, not the proposal.
+	datum_test(datum_commitments_pack(&job, 300, use, &count, &size));
+	datum_test(!use[0] && use[1] && use[2] && use[3] && use[4]);
+	datum_test(count == 4 && size == 47 + 47 + 18 + 47);
+	// Room for the accepts and the vote only: the ack waits.
+	datum_test(datum_commitments_pack(&job, 47 + 47 + 18, use, &count, &size));
+	datum_test(!use[0] && !use[1] && use[2] && use[3] && use[4]);
+	// Room for one accept, not both: neither goes in, and the type is marked
+	// as not carrying them; what fits of the rest still does.
+	datum_test(!datum_commitments_pack(&job, 60, use, &count, &size));
+	datum_test(!use[2] && !use[4] && use[3] && count == 1 && size == 18);
+	// Room for everything: everything.
+	datum_test(datum_commitments_pack(&job, 5000, use, &count, &size));
+	datum_test(count == 5 && size == job.commitments_size);
+	// No accepts at all: carried trivially.
+	static T_DATUM_STRATUM_JOB votes;
+	memset(&votes, 0, sizeof(votes));
+	put_commitment(&votes, HEX_M4);
+	datum_test(datum_commitments_pack(&votes, 0, use, &count, &size) && count == 0);
+
+	// In a coinbase type: a proposal too large for it no longer takes the
+	// accepts out with it, and the output count matches what is written.
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&tpl, 0, sizeof(tpl));
+	memset(tpl.default_witness_commitment, 'a', 64);
+	job.block_template = &tpl;
+	job.coinbase_value = 1000ULL * 100000000ULL;
+	job.pool_addr_script_len = 22;
+	job.pool_addr_script[0] = 0x00; job.pool_addr_script[1] = 0x14;
+	int cb1idx[MAX_COINBASE_TYPES] = { 0 }, cb2idx[MAX_COINBASE_TYPES] = { 0 };
+	generate_coinbase_txns_for_stratum_job_subtypebysize(&job, 1, 300, true, cb1idx, cb2idx, false);
+	datum_test(job.coinbase[1].carries_accepts);
+	datum_test(strstr(job.coinbase[1].coinb2, "d1617368") != NULL);
+	datum_test(strstr(job.coinbase[1].coinb2, "d77d1776") != NULL);
+	datum_test(strstr(job.coinbase[1].coinb2, "d5e0c4af") == NULL);
+	int declared = -1, trailing = -1;
+	datum_test(coinb2_outputs(job.coinbase[1].coinb2, &declared, &trailing) == declared && trailing == 4);
+	printf("  a small coinbase carries the BMM accepts first, then what else fits by rank\n");
+}
+
+// Coinbase 0 is what every client mines until the coinbaser lands, and for the
+// whole of a job that never runs it. It carries the template's commitments as
+// far as they fit, so that work is not empty for every block with a bid.
+// And the subsidy-only coinbase is rebuilt whenever the coinbases are, from
+// what holds then: built once at job creation, it kept an old payout script
+// and, after the pool link changed, the PoT byte in the wrong place.
+static void the_plain_coinbase_carries_commitments_and_the_empty_one_is_current(void) {
+	static T_DATUM_STRATUM_JOB job;
+	static T_DATUM_TEMPLATE_DATA tpl;
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+	memset(tpl.default_witness_commitment, 'a', 64);
+	char saved_addr[sizeof(datum_config.mining_pool_address)];
+	memcpy(saved_addr, datum_config.mining_pool_address, sizeof(saved_addr));
+	strcpy(datum_config.mining_pool_address, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+	tpl.sizelimit = 4000000;
+	tpl.weightlimit = 4000000;
+	job.block_template = &tpl;
+	job.height = 900000;
+	job.coinbase_value = 4 * 100000000ULL;
+	put_commitment(&job, HEX_M7);
+	put_commitment(&job, HEX_M4);
+	put_proposal(&job);
+
+	generate_base_coinbase_txns_for_stratum_job(&job, false);
+	datum_test(job.coinbase[0].carries_accepts);
+	datum_test(strstr(job.coinbase[0].coinb2, "d1617368") != NULL);
+	datum_test(strstr(job.coinbase[0].coinb2, "d77d1776") != NULL);
+	datum_test(strstr(job.coinbase[0].coinb2, "d5e0c4af") == NULL);
+	int declared = -1, trailing = -1;
+	datum_test(coinb2_outputs(job.coinbase[0].coinb2, &declared, &trailing) == declared && trailing == 4);
+	datum_test(declared == 4); // the accept, the vote, us, the witness commitment
+	// The empty work's coinbase: our output alone, the subsidy, no commitments.
+	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "d1617368") == NULL);
+	datum_test(coinb2_outputs(job.subsidy_only_coinbase.coinb2, &declared, &trailing) == 1 && declared == 1 && trailing == 4);
+	datum_test(job.subsidy_only_coinbase.coinb2_len * 2 == (int)strlen(job.subsidy_only_coinbase.coinb2));
+	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "0014e8df018c7e326cc253faac7e46cdc51e68542c42") != NULL);
+
+	// The payout address changes before the coinbaser runs: the empty work
+	// pays the new one too, not only the full coinbases.
+	strcpy(datum_config.mining_pool_address, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+	generate_coinbase_txns_for_stratum_job(&job, false);
+	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "0014751e76e8199196d454941c45d1b3a323f1433bd6") != NULL);
+	datum_test(strstr(job.subsidy_only_coinbase.coinb2, "e8df018c7e326cc253faac7e46cdc51e68542c42") == NULL);
+	datum_test(memcmp(job.subsidy_only_coinbase.coinb1, job.coinbase[0].coinb1, 20) == 0);
+	datum_test(job.coinbase[0].carries_accepts);
+
+	memcpy(datum_config.mining_pool_address, saved_addr, sizeof(saved_addr));
+	printf("  coinbase 0 carries the template's commitments; the empty work's coinbase is rebuilt with it\n");
+}
+
 void datum_blocktemplates_tests(void) {
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();
@@ -1135,6 +1269,8 @@ void datum_blocktemplates_tests(void) {
 	a_malformed_pool_payload_leaves_the_template_whole();
 	pool_commitments_follow_chains_rules();
 	the_output_count_matches_the_outputs_written();
+	commitments_are_packed_by_rank();
+	the_plain_coinbase_carries_commitments_and_the_empty_one_is_current();
 	an_m4_of_the_wrong_length_is_recognised();
 	the_pool_vote_replaces_the_templates_vote_of_the_same_kind();
 	a_skipped_template_commitment_leaves_no_hole();

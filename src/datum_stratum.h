@@ -110,10 +110,10 @@ typedef struct {
 	
 	int coinb1_len;
 	int coinb2_len;
-	// Whether this coinbase carries the job's whole commitment set. False
-	// when the set did not fit the type's budget, which is safe for votes
-	// and fatal for a BMM accept: the block still holds the request.
-	bool carries_commitments;
+	// Whether this coinbase carries every BMM accept of the job's commitment
+	// set (datum_commitments_pack). Leaving out a vote, an ack or a proposal
+	// is safe; leaving out an accept is fatal: the block still holds the bid.
+	bool carries_accepts;
 } T_DATUM_STRATUM_COINBASE;
 
 typedef struct {

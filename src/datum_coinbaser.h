@@ -48,6 +48,15 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 bool datum_script_is_one_push(const unsigned char *script, int len);
 bool datum_commitment_tag(const unsigned char *script, int len, unsigned char out[4]);
 
+// Which of the job's commitments a coinbase with `budget` bytes for them
+// carries (use[k]), how many and their bytes: every BMM accept or none, then
+// votes, acks, bundles, proposals and the rest while they fit. True if every
+// accept is in. Exposed for the tests.
+bool datum_commitments_pack(const T_DATUM_STRATUM_JOB *s, int budget, bool *use, int *count, int *size);
+
+// Load the template's own commitments into the job; their bytes in the coinbase.
+int commitments_from_template(T_DATUM_STRATUM_JOB *s);
+
 // Drop every commitment on the job carrying this tag, keeping the rest.
 void datum_commitments_drop_tag(T_DATUM_STRATUM_JOB *s, const unsigned char tag[4]);
 

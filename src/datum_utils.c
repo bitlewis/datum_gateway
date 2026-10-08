@@ -91,6 +91,34 @@ void get_target_from_diff(unsigned char *result, uint64_t diff) {
 	}
 }
 
+// The highest whole share difficulty whose target still takes every hash that
+// meets block_target: the most a miner may be asked for without hashes that
+// would be blocks going unreported. A miner only submits what meets its share
+// target, so a share difficulty above the network's loses the blocks between
+// the two -- common on a chain with a min-difficulty rule, where a block at
+// difficulty 1 follows twenty minutes without one. Never below 1, the least a
+// whole difficulty can be (a regtest target is easier still).
+uint64_t datum_diff_cap_for_target(const uint8_t *block_target) {
+	unsigned char t[32];
+	uint64_t lo = 1, hi = UINT64_MAX, mid;
+	
+	get_target_from_diff(t, hi);
+	if (compare_hashes(block_target, t) <= 0) return hi;
+	get_target_from_diff(t, lo);
+	if (compare_hashes(block_target, t) > 0) return lo;
+	// target(lo) takes block_target, target(hi) does not: targets fall as the difficulty rises.
+	while (hi - lo > 1) {
+		mid = lo + ((hi - lo) >> 1);
+		get_target_from_diff(t, mid);
+		if (compare_hashes(block_target, t) <= 0) {
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo;
+}
+
 uint64_t get_process_uptime_seconds() {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);

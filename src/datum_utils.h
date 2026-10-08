@@ -69,6 +69,7 @@ void hex_to_bin_le(const char *hex, unsigned char *bin);
 void hex_to_bin(const char *hex, unsigned char *bin);
 void hash2hex(unsigned char *bytes, char *hexString);
 void get_target_from_diff(unsigned char *result, uint64_t diff);
+uint64_t datum_diff_cap_for_target(const uint8_t *block_target);
 uint64_t roundDownToPowerOfTwo_64(uint64_t x);
 int addr_2_output_script(const char *addr, unsigned char *script, int max_len);
 int output_script_2_addr(const unsigned char *script, const int len, char *addr);

@@ -763,6 +763,57 @@ void reset_vardiff_stats(T_DATUM_CLIENT_DATA *c) {
 	m->share_snap_tsms = m->sdata->loop_tsms;
 }
 
+// The difficulty a client is told for a job: the pool difficulty (vardiff,
+// quickdiff, the d= floor, NiceHash's 524288, the pool's minimum -- all of
+// them live in current_diff), capped at the job's network difficulty. Above
+// that, a hash that is a block but misses the share target is never
+// submitted, and the block is lost. The cap moves only the target the client
+// is told: the PoT byte in the coinbase, and so what the pool is sent, stays
+// the pool difficulty (see datum_stratum_share_is_for_pool).
+uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap) {
+	if (!pool_diff) pool_diff = 1;
+	if (diff_cap && pool_diff > diff_cap) return diff_cap;
+	return pool_diff;
+}
+
+// Whether a share that met the target the client was told (sent_diff) also
+// meets the pool difficulty its coinbase's PoT byte claims. Only those go to
+// the pool, and only those count toward the client's stats and vardiff: the
+// rest exist because the client's difficulty was capped at the network's, so
+// they are checked for a block and acknowledged, and nothing else. Sending
+// them would be shares the pool rejects as below their own target byte.
+bool datum_stratum_share_is_for_pool(const unsigned char *share_hash, uint64_t sent_diff, uint64_t pool_diff) {
+	unsigned char t[32];
+	if (!pool_diff || sent_diff >= pool_diff) return true;
+	get_target_from_diff(t, pool_diff);
+	return compare_hashes(share_hash, t) <= 0;
+}
+
+// Whether a hash that meets the block target should still be handed to the
+// node. With the client's difficulty capped at the network's, every share on
+// a min-difficulty block is a block, and a rig sends thousands a second until
+// its new work arrives -- each one a synchronous submitblock on this thread,
+// which is what keeps that new work from arriving. Once the node has taken a
+// block on a previous block, another on the same one adds nothing (it is a
+// sibling the node never switches to); a stale job gets one try per previous
+// block, kept for the race the late block of our own can still win.
+bool datum_stratum_block_is_wanted(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job) {
+	if (!sdata || !sdata->last_block_tried) return true;
+	if (memcmp(sdata->last_block_prevhash, job->prevhash_bin, 32) != 0) return true;
+	if (sdata->last_block_accepted) return false;
+	return !job->is_stale_prevblock;
+}
+
+void datum_stratum_note_block_tried(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, bool accepted) {
+	if (!sdata) return;
+	if (!sdata->last_block_tried || memcmp(sdata->last_block_prevhash, job->prevhash_bin, 32) != 0) {
+		memcpy(sdata->last_block_prevhash, job->prevhash_bin, 32);
+		sdata->last_block_tried = true;
+		sdata->last_block_accepted = false;
+	}
+	if (accepted) sdata->last_block_accepted = true;
+}
+
 void stratum_update_vardiff(T_DATUM_CLIENT_DATA *c, bool no_quick) {
 	// Should be called at/around a share being accepted?
 	// before processing a mining notify? (for downward
@@ -1239,7 +1290,11 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	// most important thing to do right here is to check if the share is a block
 	// there's some downstream failures that can impact the share being valid, but at this point it's
 	// possible for this block to be valid.  even if it's stale or something we're going to try it.
-	if (compare_hashes(share_hash, job->block_target) <= 0) {
+	if (compare_hashes(share_hash, job->block_target) <= 0 && !datum_stratum_block_is_wanted(m->sdata, job)) {
+		// A block on a previous block this thread already has a block on: see
+		// datum_stratum_block_is_wanted. It goes on as an ordinary share, and
+		// is not logged: there can be thousands of them a second.
+	} else if (compare_hashes(share_hash, job->block_target) <= 0) {
 		// BLOCK
 		// since we check this early, it's possible a duplicate share submission could trigger this twice... but that's alright.
 		// it won't hurt to re-submit a block.
@@ -1253,6 +1308,7 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		DLOG_WARN("************************************************************************************************");
 		
 		i = assembleBlockAndSubmit(block_header, full_cb_txn, cb->coinb1_len+12+cb->coinb2_len, job, m->sdata, new_notify_blockhash, empty_work);
+		datum_stratum_note_block_tried(m->sdata, job, i != 0);
 		if (i) {
 			// successfully submitted
 			datum_blocktemplates_notifynew(new_notify_blockhash, job->height + 1);
@@ -1326,6 +1382,18 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		send_rejected_duplicate(c, id);
 		m->share_count_rejected++;
 		m->share_diff_rejected += job_diff;
+		return 0;
+	}
+	
+	// Met the target the client was told, which may be below the pool
+	// difficulty its coinbase's PoT byte claims (the client's was capped at
+	// the network's): the pool never sees those, and the client's stats and
+	// vardiff count only shares at the pool difficulty, as they always have.
+	// A block among them was handled above.
+	if (!datum_stratum_share_is_for_pool(share_hash, quickdiff ? m->quickdiff_sdiff : m->stratum_job_sdiffs[g_job_index], job_diff)) {
+		char s[256];
+		snprintf(s, sizeof(s), "{\"error\":null,\"id\":%"PRIu64",\"result\":true}\n", id);
+		datum_socket_send_string_to_client(c, s);
 		return 0;
 	}
 	
@@ -1564,6 +1632,8 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	return 0;
 }
 
+static int send_mining_set_difficulty_for_job(T_DATUM_CLIENT_DATA *c, const T_DATUM_STRATUM_JOB *j);
+
 int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool new_block) {
 	// send the current job to the miner
 	
@@ -1627,21 +1697,24 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 	}
 	
 	// if we have an updated difficulty to send, send it before we send the notify
-	// applies to quick and normal diff changes
-	if (m->last_sent_diff != m->current_diff) {
-		send_mining_set_difficulty(c);
+	// applies to quick and normal diff changes, and to a job whose network
+	// difficulty caps the client's differently from the last one's
+	if ((m->last_sent_diff != m->current_diff) || (m->last_sent_stratum_diff != datum_stratum_client_diff(m->current_diff, j->diff_cap))) {
+		send_mining_set_difficulty_for_job(c, j);
 	}
 	
 	// if this is a quick diff change, the job is likely identical to one we've already sent
 	// in which case, we don't want to clobber the normal target table and reject shares that we shouldn't
 	if (!quickdiff) {
-		get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_diff);
+		get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_stratum_diff);
 		m->stratum_job_diffs[j->global_index] = m->last_sent_diff;
+		m->stratum_job_sdiffs[j->global_index] = m->last_sent_stratum_diff;
 		m->quickdiff_active = false;
 	} else {
 		m->quickdiff_active = true;
 		m->quickdiff_value = m->last_sent_diff;
-		get_target_from_diff(m->quickdiff_target, m->quickdiff_value);
+		m->quickdiff_sdiff = m->last_sent_stratum_diff;
+		get_target_from_diff(m->quickdiff_target, m->quickdiff_sdiff);
 	}
 	
 	if (j->job_state >= JOB_STATE_FULL_PRIORITY_WAIT_COINBASER) {
@@ -1697,8 +1770,9 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 			// The targets above were set for a quick difficulty change: set them as for a new job,
 			// or the coinbase rebuilt for its shares would have the old difficulty's PoT byte, and
 			// every share -- and a block found on it -- would fail.
-			get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_diff);
+			get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_stratum_diff);
 			m->stratum_job_diffs[j->global_index] = m->last_sent_diff;
+			m->stratum_job_sdiffs[j->global_index] = m->last_sent_stratum_diff;
 			m->quickdiff_active = false;
 		}
 		quickdiff = false;
@@ -1778,7 +1852,10 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 	return 0;
 }
 
-int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c) {
+// Tell the client current_diff, capped at the network difficulty of the job
+// its next work is on (datum_stratum_client_diff). No job yet: uncapped, and
+// the notify that follows sends it again if its job caps it.
+static int send_mining_set_difficulty_for_job(T_DATUM_CLIENT_DATA *c, const T_DATUM_STRATUM_JOB *j) {
 	char s[256];
 	T_DATUM_MINER_DATA * const m = c->app_client_data;
 	
@@ -1786,12 +1863,19 @@ int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c) {
 		m->current_diff = datum_config.stratum_v1_vardiff_min;
 	}
 	
-	snprintf(s, sizeof(s), "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[%"PRIu64"]}\n", (uint64_t)m->current_diff);
+	const uint64_t sdiff = datum_stratum_client_diff(m->current_diff, j ? j->diff_cap : 0);
+	snprintf(s, sizeof(s), "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[%"PRIu64"]}\n", sdiff);
 	datum_socket_send_string_to_client(c, s);
 	
 	m->last_sent_diff = m->current_diff;
+	m->last_sent_stratum_diff = sdiff;
 	
 	return 0;
+}
+
+int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c) {
+	T_DATUM_MINER_DATA * const m = c->app_client_data;
+	return send_mining_set_difficulty_for_job(c, m->sdata ? m->sdata->cur_stratum_job : NULL);
 }
 
 // The coinbase types by the names the dashboard uses, and by number. -1 if the
@@ -2261,6 +2345,7 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	
 	// calculate block target from nbits
 	nbits_to_target(s->nbits_uint, s->block_target);
+	s->diff_cap = datum_diff_cap_for_target(s->block_target);
 	
 	// if this is to be a clean job, remember that
 	s->is_new_block = new_block;

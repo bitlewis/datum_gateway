@@ -139,6 +139,9 @@ typedef struct {
 	char ntime[10];
 	
 	unsigned char block_target[32];
+	// The most share difficulty a client may be sent on this job: every hash
+	// that is a block still meets its target (datum_diff_cap_for_target).
+	uint64_t diff_cap;
 	
 	T_DATUM_TEMPLATE_DATA *block_template;
 	
@@ -220,6 +223,12 @@ typedef struct T_DATUM_STRATUM_THREADPOOL_DATA {
 	uint64_t last_job_height;
 	uint64_t next_kick_check_tsms;
 	
+	// The last block this thread handed to the node: the previous block it
+	// builds on, and whether the node took it. See datum_stratum_block_is_wanted.
+	unsigned char last_block_prevhash[32];
+	bool last_block_tried;
+	bool last_block_accepted;
+	
 	char submitblock_req[MAX_SUBMITBLOCK_SIZE];
 	
 	void *dupes;
@@ -259,11 +268,20 @@ typedef struct {
 	bool worker_auth_sent;
 	uint64_t subscribe_tsms;
 	
+	// current_diff is the share difficulty for the pool: vardiff, the floors,
+	// the pool's minimum, and the PoT byte in the coinbase all work in it.
+	// last_sent_diff is the current_diff the client's work was last made with.
 	uint64_t last_sent_diff;
 	uint64_t current_diff;
+	// What the client was last told in mining.set_difficulty: current_diff,
+	// capped at the job's network difficulty (see datum_stratum_client_diff).
+	uint64_t last_sent_stratum_diff;
 	
+	// Per job: the target the client was told (from stratum_job_sdiffs), and
+	// the pool difficulty its work carries (stratum_job_diffs, the PoT byte).
 	uint8_t stratum_job_targets[MAX_STRATUM_JOBS][32];
 	uint64_t stratum_job_diffs[MAX_STRATUM_JOBS];
+	uint64_t stratum_job_sdiffs[MAX_STRATUM_JOBS];
 	
 	unsigned char coinbase_selection;
 	// The client chose its coinbase type itself (cb= in its password): kept over defaults and fingerprints.
@@ -282,6 +300,7 @@ typedef struct {
 	
 	bool quickdiff_active;
 	uint64_t quickdiff_value;
+	uint64_t quickdiff_sdiff;
 	uint8_t quickdiff_target[32];
 	
 	uint64_t forced_high_min_diff;
@@ -310,6 +329,10 @@ int datum_stratum_coinbase_type_from_rules(const char *ua);
 int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t coinbase_txn_size, T_DATUM_STRATUM_JOB *job, T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const char *block_hash_hex, bool empty_work);
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only);
 int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c);
+uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap);
+bool datum_stratum_share_is_for_pool(const unsigned char *share_hash, uint64_t sent_diff, uint64_t pool_diff);
+bool datum_stratum_block_is_wanted(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job);
+void datum_stratum_note_block_tried(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, bool accepted);
 bool stratum_latest_empty_check_ready_for_full(void);
 
 // Server thread main loop

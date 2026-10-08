@@ -45,6 +45,7 @@ The same build mines all of these, deciding from what the node's block template 
   - a gateway whose own template already carries accepts keeps them rather than taking the pool's;
   - a miner whose coinbase type is too small to carry an accept gets empty work (no transactions, so no request to answer) until one fits;
   - a template over 16,383 transactions is refused rather than truncated, because truncation can drop a request while keeping its accept.
+- **Share difficulty never exceeds the network's.** A miner reports only hashes that meet its share target, so above the block's difficulty it would hash past blocks without reporting them. That is common on a chain with a min-difficulty rule. Each client is sent its difficulty capped at the job's network difficulty; this applies to vardiff, quickdiff, `d=` and NiceHash's 524288 alike. The PoT byte in the coinbase still carries the uncapped difficulty, and only shares that meet it go to the pool. Once the node has taken a block on a given previous block, the stratum thread that found it submits no further blocks on it.
 - **preciousblock follows the block.** The tie-break is sent to the node the block was actually submitted to. An enforcer does not implement preciousblock, so list your node in `extra_block_submissions` to keep it.
 - The user agent carries `+drivechains`, which is how a pool knows it may send the extended format.
 

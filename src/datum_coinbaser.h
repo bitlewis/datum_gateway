@@ -42,6 +42,8 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block);
 // The coinbase input as hex into cb (BIP34 height, tags, unique ID); its length
 // in bytes. *target_pot_index gets the PoT placeholder's offset within it.
+// What the subsidy-only coinbase pays: min(block_reward, the template's value less its fees).
+uint64_t datum_job_subsidy_value(const T_DATUM_STRATUM_JOB *s);
 int generate_coinbase_input(int height, char *cb, int *target_pot_index, bool datum_active);
 // Whether a pool payout script is a standard address (P2PKH, P2SH, segwit).
 bool datum_payout_script_is_standard(const unsigned char *script, int len);

@@ -485,6 +485,21 @@ static void coinbase_hex_to_bin(T_DATUM_STRATUM_COINBASE *c) {
 	c->coinb2_len = i >> 1;
 }
 
+// What the subsidy-only coinbase of empty work may pay: the template's value
+// less the fees of its transactions, which that block does not carry -- and
+// never more than Bitcoin's schedule. block_reward(height) alone is Bitcoin's
+// schedule, and a chain that halves sooner (Chains regtest, every 150 blocks)
+// took every empty block as bad-cb-amount.
+uint64_t datum_job_subsidy_value(const T_DATUM_STRATUM_JOB *s) {
+	uint64_t fees = 0;
+	if (s->block_template) {
+		for (uint32_t t = 0; t < s->block_template->txn_count; t++) fees += s->block_template->txns[t].fee_sats;
+	}
+	const uint64_t from_template = s->coinbase_value > fees ? s->coinbase_value - fees : 0;
+	const uint64_t schedule = block_reward(s->height);
+	return from_template < schedule ? from_template : schedule;
+}
+
 // Coinbase 0, the plain one: the pool's (or our) output, the witness
 // commitment, and the commitments that fit the smallest coinbase a client
 // takes (type 1's); and, from the same start, the subsidy-only coinbase of
@@ -562,7 +577,7 @@ static void build_plain_coinbase(T_DATUM_STRATUM_JOB *s, bool space_for_en_in_co
 	cb2idx[0] += sprintf(&s->coinbase[0].coinb2[cb2idx[0]], "00000000");
 	
 	// The subsidy-only payout: the subsidy for the height, to our output's script, then the lock time.
-	sprintf(&sub->coinb2[sub2], "%016llx", (unsigned long long)__builtin_bswap64(block_reward(s->height))); // subsidy calc for height
+	sprintf(&sub->coinb2[sub2], "%016llx", (unsigned long long)__builtin_bswap64(datum_job_subsidy_value(s)));
 	memcpy(&sub->coinb2[sub2+16], &s->coinbase[0].coinb2[j+16], k-j-16);
 	sprintf(&sub->coinb2[sub2 + (k-j)], "00000000");
 	

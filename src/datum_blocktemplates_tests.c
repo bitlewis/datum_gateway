@@ -38,6 +38,13 @@
 #include "datum_conf.h"
 #include "datum_protocol.h"
 
+// The template ring, set up once for every test that parses a template.
+static bool templates_ready(void) {
+	static int done = 0;
+	if (!done) done = datum_template_init() > 0 ? 1 : -1;
+	return done > 0;
+}
+
 // Build a coinbase transaction hex from a list of (value, scriptPubKey) pairs.
 // Segwit-serialised with a single input, which is what a template server sends.
 static void unhex_into(const char *hex, uint8_t *out, uint32_t *n);
@@ -1031,7 +1038,7 @@ static void a_template_without_an_enforcer_drops_the_bmm_bids(void) {
 // the function. The unit test above proves the drop works; this proves it is
 // actually reached for a template that did not come from an enforcer.
 static void the_parser_drops_bids_when_there_is_no_enforcer(void) {
-	if (!datum_test(datum_template_init() > 0)) return;
+	if (!datum_test(templates_ready())) return;
 
 	// One M8 bid and one ordinary payment, as a node would hand them over.
 	const char *bid =
@@ -1073,7 +1080,7 @@ static void the_parser_drops_bids_when_there_is_no_enforcer(void) {
 // and do not list the rule. Such a template parses, and the coinbase built from
 // it declares exactly the outputs it carries, with no commitment among them.
 static void a_chain_without_segwit_gets_a_coinbase_without_the_commitment(void) {
-	if (!datum_test(datum_template_init() > 0)) return;
+	if (!datum_test(templates_ready())) return;
 	const char *fmt =
 	    "{\"height\":82182,\"coinbasevalue\":5000000000,\"rules\":[%s],"
 	    "\"mintime\":1790032394,\"curtime\":1790033442,\"version\":536870912,\"sigoplimit\":640000,"
@@ -1489,11 +1496,68 @@ static void a_tag_too_long_is_cut_not_fatal(void) {
 	printf("  a tag too long for the coinbase is cut, not fatal\n");
 }
 
+// The subsidy-only coinbase paid block_reward(height), Bitcoin's schedule.
+// Chains regtest halves every 150 blocks: at height 300 the subsidy is 12.5,
+// Bitcoin's 50, and every empty block was bad-cb-amount. It pays the
+// template's value less its transactions' fees, and never more than the
+// schedule.
+static void the_empty_coinbase_pays_what_the_template_allows(void) {
+	static T_DATUM_STRATUM_JOB job;
+	static T_DATUM_TEMPLATE_DATA tpl;
+	static T_DATUM_TEMPLATE_TXN txns[2];
+	char saved_addr[sizeof(datum_config.mining_pool_address)];
+	memcpy(saved_addr, datum_config.mining_pool_address, sizeof(saved_addr));
+	strcpy(datum_config.mining_pool_address, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+	memset(txns, 0, sizeof(txns));
+	tpl.sizelimit = 4000000;
+	tpl.weightlimit = 4000000;
+	txns[0].fee_sats = 1500;
+	txns[1].fee_sats = 2500;
+	tpl.txns = txns;
+	tpl.txn_count = 2;
+	job.block_template = &tpl;
+	job.height = 300;
+	job.coinbase_value = 1250000000ULL + 4000;
+	datum_test(datum_job_subsidy_value(&job) == 1250000000ULL);
+	generate_base_coinbase_txns_for_stratum_job(&job, false);
+	int outs = 0;
+	uint64_t sum = 0;
+	datum_test(decode_coinbase(&job.subsidy_only_coinbase, &outs, &sum) > 0 && sum == 1250000000ULL);
+	// The full coinbase still pays the whole value.
+	datum_test(decode_coinbase(&job.coinbase[0], &outs, &sum) > 0 && sum == 1250000000ULL + 4000);
+	// Never above Bitcoin's schedule, whatever the template says.
+	job.height = 900000;
+	job.coinbase_value = 100 * 100000000ULL;
+	datum_test(datum_job_subsidy_value(&job) == block_reward(900000));
+	// Fees past the value (a template that disagrees with itself): nothing, not a wrap.
+	job.coinbase_value = 3000;
+	datum_test(datum_job_subsidy_value(&job) == 0);
+	
+	// The header template of a refused one: the node's value less the fees it lists.
+	if (datum_test(templates_ready())) {
+		json_error_t err;
+		json_t *j = json_loads("{\"height\":300,\"coinbasevalue\":1250004000,\"mintime\":1,\"curtime\":2,\"version\":536870912,"
+		                       "\"sigoplimit\":80000,\"bits\":\"207fffff\",\"sizelimit\":4000000,\"weightlimit\":4000000,"
+		                       "\"previousblockhash\":\"0000000000000000e371b1e760aa93bcaa309f626beb59bff6c61f3e56443d48\","
+		                       "\"target\":\"7fffff0000000000000000000000000000000000000000000000000000000000\","
+		                       "\"transactions\":[{\"fee\":1500},{\"fee\":2500}]}", 0, &err);
+		if (datum_test(j != NULL)) {
+			T_DATUM_TEMPLATE_DATA *e = datum_gbt_header_template(j);
+			datum_test(e != NULL && e->coinbasevalue == 1250000000ULL);
+			json_decref(j);
+		}
+	}
+	memcpy(datum_config.mining_pool_address, saved_addr, sizeof(saved_addr));
+	printf("  the empty coinbase pays the template's subsidy, not Bitcoin's schedule\n");
+}
+
 // A refused template for a new block used to keep the previous job, leaving
 // every miner on the block before. Its header is enough for empty work: a
 // block with no transactions, no commitments and the subsidy alone.
 static void a_refused_template_still_moves_miners_to_the_new_block(void) {
-	if (!datum_test(datum_template_init() > 0)) return;
+	if (!datum_test(templates_ready())) return;
 	// An enforcer template (coinbasetxn, from the alphanet enforcer) over
 	// 16383 transactions: refused before a transaction is read.
 	static const char *cbtxn =
@@ -1579,6 +1643,7 @@ static void a_refused_template_still_moves_miners_to_the_new_block(void) {
 void datum_blocktemplates_tests(void) {
 	a_long_tag_leaves_coinbase_0_alone();
 	a_tag_too_long_is_cut_not_fatal();
+	the_empty_coinbase_pays_what_the_template_allows();
 	a_refused_template_still_moves_miners_to_the_new_block();
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();

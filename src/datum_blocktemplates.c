@@ -755,9 +755,22 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_header_template(json_t *gbt) {
 	tdata->coinbasevalue = block_reward(tdata->height);
 	{
 		// The node's value includes the fees of transactions this block will
-		// not carry; it can still only ever lower what the subsidy may claim.
-		const uint64_t declared = json_integer_value(json_object_get(gbt, "coinbasevalue"));
-		if (declared && declared < tdata->coinbasevalue) tdata->coinbasevalue = declared;
+		// not carry: less those, it is the subsidy as the chain counts it,
+		// which on a chain with its own schedule (Chains regtest halves every
+		// 150 blocks) is below Bitcoin's block_reward.
+		uint64_t declared = json_integer_value(json_object_get(gbt, "coinbasevalue"));
+		json_t *txs = json_object_get(gbt, "transactions");
+		uint64_t fees = 0;
+		if (json_is_array(txs)) {
+			for (size_t t = 0; t < json_array_size(txs); t++) {
+				const json_int_t f = json_integer_value(json_object_get(json_array_get(txs, t), "fee"));
+				if (f > 0) fees += (uint64_t)f;
+			}
+		}
+		if (declared) {
+			declared = declared > fees ? declared - fees : 0;
+			if (declared < tdata->coinbasevalue) tdata->coinbasevalue = declared;
+		}
 	}
 	tdata->txn_count = 0;
 	tdata->commitments_count = 0;

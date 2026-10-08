@@ -1052,8 +1052,7 @@ int datum_m4_entry_count(const unsigned char *script, int len) {
 // sidechain, each abstaining, downvoting, or naming a bundle that is pending.
 // A vote that does not fit makes the block invalid. A node that does not say
 // (an enforcer, as on eCash) leaves the check to the one against the
-// template's own M4, in datum_coinbaser_v2_parse -- and with no M4 there
-// either, an explicit vector is not carried at all. Not an M4: nothing to check.
+// template's own M4, in datum_coinbaser_v2_parse. Not an M4: nothing to check.
 bool datum_m4_fits_template(const unsigned char *script, int len, const T_DATUM_TEMPLATE_DATA *t) {
 	unsigned char tag[4];
 	if (!datum_commitment_tag(script, len, tag)) return true;
@@ -1307,17 +1306,6 @@ int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, i
 						DLOG_ERROR("Pool sent an M4 voting for %d sidechains where this template has %d. "
 						           "Keeping the template's: a vector of the wrong length is an invalid "
 						           "block, not a smaller vote.", mine, theirs);
-						continue;
-					}
-					// An explicit vector (forms 1 and 2) with nothing to check it
-					// against: the node did not say which sidechains and bundles
-					// there are (no drivechain_votable, as from an enforcer) and the
-					// template brought no M4 of its own to compare lengths with. A
-					// wrong vector is an invalid block and nothing here could tell,
-					// so the block abstains instead. Forms 0 and 3 carry no vector.
-					if (mine >= 0 && theirs < 0 && !(s->block_template && s->block_template->votable_known)) {
-						DLOG_ERROR("Pool sent an M4 voting for %d sidechains, and neither drivechain_votable nor the template's own M4 "
-						           "says how many there are. Not carrying it: a vector that cannot be checked could be an invalid block.", mine);
 						continue;
 					}
 					bool cleared_already = false;

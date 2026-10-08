@@ -1617,6 +1617,37 @@ static void a_pool_configuration_is_checked_before_it_is_taken(void) {
 	printf("  the pool's configuration is refused unless its payout is a standard address and its tag fits\n");
 }
 
+// A coinbaser response names only the value it answers. One arriving late for
+// a request that timed out was taken for the next request with the same value
+// -- on Chains testnet every empty block has the same value -- and merged the
+// commitments of the job before, on another block, into this one.
+static void a_late_coinbaser_answer_is_not_taken_for_the_next_job(void) {
+	unsigned char block_a[32], block_b[32];
+	memset(block_a, 0xaa, 32);
+	memset(block_b, 0xbb, 32);
+	T_DATUM_COINBASER_REQ prev = { .valid = true, .answered = false, .value = 5000000000ULL, .sent_tsms = 100000 };
+	memcpy(prev.prevhash, block_a, 32);
+	const uint64_t now = 106000;
+	// Another value: never ours.
+	datum_test(!datum_coinbaser_response_is_for(4999999999ULL, 5000000000ULL, block_b, &prev, now));
+	// The request before, on another block, for the same value, unanswered: may be its answer.
+	datum_test(!datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
+	// Its answer came already, or it was for the same block, or another value, or long ago: ours.
+	prev.answered = true;
+	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
+	prev.answered = false;
+	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_a, &prev, now));
+	prev.value = 1;
+	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
+	prev.value = 5000000000ULL;
+	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, prev.sent_tsms + DATUM_COINBASER_LATE_MS));
+	// No request before: ours.
+	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, NULL, now));
+	prev.valid = false;
+	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
+	printf("  a late coinbaser answer for a job on another block is not taken for the next one\n");
+}
+
 // A refused template for a new block used to keep the previous job, leaving
 // every miner on the block before. Its header is enough for empty work: a
 // block with no transactions, no commitments and the subsidy alone.
@@ -1709,6 +1740,7 @@ void datum_blocktemplates_tests(void) {
 	a_tag_too_long_is_cut_not_fatal();
 	the_empty_coinbase_pays_what_the_template_allows();
 	a_pool_configuration_is_checked_before_it_is_taken();
+	a_late_coinbaser_answer_is_not_taken_for_the_next_job();
 	a_refused_template_still_moves_miners_to_the_new_block();
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();

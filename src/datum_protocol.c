@@ -317,6 +317,27 @@ unsigned char *datum_coinbaser_v2_response = NULL;
 unsigned char datum_coinbaser_v2_response_buf_idx = 0;
 uint64_t datum_coinbaser_v2_response_value[2] = { 0, 0 };
 int datum_coinbaser_v2_response_len[2] = { 0, 0 };
+// Responses received so far, and the request sent last; under the fetch mutex.
+static uint64_t datum_coinbaser_response_seq = 0;
+static T_DATUM_COINBASER_REQ datum_coinbaser_last_req = { 0 };
+
+// A coinbaser response says which value it answers and nothing else: not the
+// previous block, not the job. A late answer to an earlier request (one that
+// timed out) for the same value would be taken for the next request and merge
+// that block's commitments into this one. So a response is taken for the
+// request waiting (req_value, req_prevhash) only if it echoes the value, and
+// it cannot be the answer to the request before it (prev): that one was
+// answered, or asked for another value, or for the same previous block (the
+// answer would then be as good for this one), or was sent long enough ago
+// (DATUM_COINBASER_LATE_MS) that no answer to it is coming.
+bool datum_coinbaser_response_is_for(uint64_t resp_value, uint64_t req_value, const unsigned char *req_prevhash, const T_DATUM_COINBASER_REQ *prev, uint64_t now_tsms) {
+	if (resp_value != req_value) return false;
+	if (!prev || !prev->valid || prev->answered) return true;
+	if (prev->value != resp_value) return true;
+	if (!memcmp(prev->prevhash, req_prevhash, 32)) return true;
+	if (now_tsms >= prev->sent_tsms + DATUM_COINBASER_LATE_MS) return true;
+	return false;
+}
 
 int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	if (len < 12) {
@@ -356,6 +377,7 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	memcpy(datum_coinbaser_v2_response, &data[12], x);
 	datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] = v;
 	datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx] = x;
+	datum_coinbaser_response_seq++;
 	
 	pthread_cond_signal(&datum_protocol_coinbaser_fetch_cond); // Signal the condition variable
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
@@ -397,6 +419,20 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 	
+	// What this request is for, and what was asked before it: see
+	// datum_coinbaser_response_is_for. Recorded before sending, with the count
+	// of responses so far, so an answer that arrives before the wait below
+	// starts is not missed.
+	pthread_mutex_lock(&datum_protocol_coinbaser_fetch_mutex);
+	T_DATUM_COINBASER_REQ prev = datum_coinbaser_last_req;
+	datum_coinbaser_last_req.valid = true;
+	datum_coinbaser_last_req.answered = false;
+	datum_coinbaser_last_req.value = value;
+	memcpy(datum_coinbaser_last_req.prevhash, s->prevhash_bin, 32);
+	datum_coinbaser_last_req.sent_tsms = current_time_millis();
+	uint64_t seen = datum_coinbaser_response_seq;
+	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+	
 	datum_protocol_mining_cmd(msg, i);
 	
 	// spin here for up to 5 seconds while awaiting a coinbaser response from DATUM Prime
@@ -404,24 +440,43 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	ts.tv_sec += 5; // Set timeout to 5 seconds
 	
 	pthread_mutex_lock(&datum_protocol_coinbaser_fetch_mutex);
-	
-	rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);
-	if (rc == ETIMEDOUT) {
-		pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
-		DLOG_DEBUG("Timeout waiting for coinbaser response from DATUM Prime");
-		return 0;
-	}
-	
-	if (rc != 0) {
-		DLOG_DEBUG("Error waiting for coinbaser response from DATUM Prime");
-		pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
-		return 0;
-	}
 	i = 0;
-	
-	// process received coinbase
-	if ((datum_coinbaser_v2_response) && (datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] == value)) {
+	while (1) {
+		while (datum_coinbaser_response_seq == seen) {
+			rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);
+			if (rc != 0 && datum_coinbaser_response_seq == seen) {
+				pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+				if (rc == ETIMEDOUT) {
+					DLOG_DEBUG("Timeout waiting for coinbaser response from DATUM Prime");
+				} else {
+					DLOG_DEBUG("Error waiting for coinbaser response from DATUM Prime");
+				}
+				return 0;
+			}
+		}
+		// Responses come in the order the requests went: with two or more
+		// since ours went out, the one before ours has had its answer.
+		if (datum_coinbaser_response_seq - seen > 1) prev.answered = true;
+		seen = datum_coinbaser_response_seq;
+		const uint64_t got = datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx];
+		if (!datum_coinbaser_v2_response) continue;
+		if (got != value) {
+			// Not ours: a late answer to an earlier request.
+			if (prev.valid && got == prev.value) prev.answered = true;
+			DLOG_DEBUG("Ignoring a coinbaser response for %"PRIu64" sats while waiting for one for %"PRIu64, got, value);
+			continue;
+		}
+		if (!datum_coinbaser_response_is_for(got, value, s->prevhash_bin, &prev, current_time_millis())) {
+			// The same value was asked for a job on another previous block and
+			// not answered: this may be that answer, with that block's
+			// commitments. Not taken; the next response is ours.
+			DLOG_WARN("A coinbaser response may be the late answer for the job before this one, on another block; not taking it");
+			prev.answered = true;
+			continue;
+		}
 		i = datum_coinbaser_v2_parse(s, datum_coinbaser_v2_response, datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx], false);
+		datum_coinbaser_last_req.answered = true;
+		break;
 	}
 	
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);

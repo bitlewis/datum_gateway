@@ -123,6 +123,17 @@ typedef struct {
 int datum_protocol_init(void);
 int datum_encrypt_generate_keys(DATUM_ENC_KEYS *keys);
 bool datum_protocol_is_active(void);
+// A coinbaser request: what it asked for, and whether an answer to it came.
+typedef struct {
+	bool valid;
+	bool answered;
+	uint64_t value;
+	unsigned char prevhash[32];
+	uint64_t sent_tsms;
+} T_DATUM_COINBASER_REQ;
+// After this long no answer to a request is expected any more.
+#define DATUM_COINBASER_LATE_MS 30000
+bool datum_coinbaser_response_is_for(uint64_t resp_value, uint64_t req_value, const unsigned char *req_prevhash, const T_DATUM_COINBASER_REQ *prev, uint64_t now_tsms);
 // The longest coinbase tag taken from the pool: the same bound the gateway's own tags have.
 #define DATUM_POOL_TAG_MAX 60
 bool datum_pool_config_is_acceptable(const unsigned char *script, int script_len, int tag_len);

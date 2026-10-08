@@ -239,6 +239,13 @@ extern const char *datum_blocktemplates_error;
 
 int datum_template_init(void);
 T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt);
+T_DATUM_TEMPLATE_DATA *datum_gbt_header_template(json_t *gbt);
+
+// What to do with a refused template: see datum_template_refusal_action.
+#define DATUM_REFUSAL_KEEP 0
+#define DATUM_REFUSAL_EMPTY_NEW_BLOCK 1
+#define DATUM_REFUSAL_EMPTY_REFRESH 2
+int datum_template_refusal_action(bool new_block, bool on_empty_fallback, uint64_t ms_since_job, uint64_t refresh_ms, uint64_t stale_ms);
 void *datum_gateway_template_thread(void *args);
 void datum_blocktemplates_notifynew_sighandler();
 void datum_blocktemplates_notifynew(const char *prevhash, int height);

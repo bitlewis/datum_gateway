@@ -1317,7 +1317,95 @@ static void the_plain_coinbase_carries_commitments_and_the_empty_one_is_current(
 	printf("  coinbase 0 carries the template's commitments, and it and the empty coinbase never change once handed out\n");
 }
 
+// A refused template for a new block used to keep the previous job, leaving
+// every miner on the block before. Its header is enough for empty work: a
+// block with no transactions, no commitments and the subsidy alone.
+static void a_refused_template_still_moves_miners_to_the_new_block(void) {
+	if (!datum_test(datum_template_init() > 0)) return;
+	// An enforcer template (coinbasetxn, from the alphanet enforcer) over
+	// 16383 transactions: refused before a transaction is read.
+	static const char *cbtxn =
+		"020000000001010000000000000000000000000000000000000000000000000000000000"
+		"000000ffffffff04035d340fffffffff027b95c912000000001600141f8cf1fd34d0c377"
+		"0c58023f1f0f7750b2dd18c30000000000000000266a24aa21a9ed52aeb9bd30449a1502"
+		"50bd83cfc5aa41ac7526f50fff47ce76963b66cb02259b01200000000000000000000000"
+		"00000000000000000000000000000000000000000000000000";
+	const int ntx = 16384;
+	char *gbt = malloc(4096 + ntx * 3);
+	if (!datum_test(gbt != NULL)) return;
+	int n = snprintf(gbt, 4096,
+	    "{\"height\":996445,\"coinbasevalue\":315200891,\"coinbasetxn\":{\"data\":\"%s\"},"
+	    "\"mintime\":1788470000,\"curtime\":1788470100,\"version\":536870912,\"sigoplimit\":80000,"
+	    "\"bits\":\"1d00ffff\",\"sizelimit\":4000000,\"weightlimit\":4000000,"
+	    "\"previousblockhash\":\"0000000000000000e371b1e760aa93bcaa309f626beb59bff6c61f3e56443d48\","
+	    "\"target\":\"00000000ffff0000000000000000000000000000000000000000000000000000\","
+	    "\"default_witness_commitment\":\"6a24aa21a9ed52aeb9bd30449a150250bd83cfc5aa41ac7526f50fff47ce76963b66cb02259b\","
+	    "\"transactions\":[", cbtxn);
+	for (int i = 0; i < ntx; i++) n += sprintf(&gbt[n], i ? ",{}" : "{}");
+	strcpy(&gbt[n], "]}");
+	json_error_t err;
+	json_t *j = json_loads(gbt, 0, &err);
+	free(gbt);
+	if (!datum_test(j != NULL)) { printf("  (fixture: %s)\n", err.text); return; }
+	datum_test(datum_gbt_parser(j) == NULL);
+	
+	T_DATUM_TEMPLATE_DATA *e = datum_gbt_header_template(j);
+	json_decref(j);
+	if (!datum_test(e != NULL)) return;
+	datum_test(e->height == 996445);
+	datum_test(!strcmp(e->previousblockhash, "0000000000000000e371b1e760aa93bcaa309f626beb59bff6c61f3e56443d48"));
+	datum_test(e->previousblockhash_bin[0] == 0x48 && e->bits_uint == 0x1d00ffff && e->curtime == 1788470100 && e->mintime == 1788470000);
+	datum_test(e->txn_count == 0 && e->commitments_count == 0 && !e->from_enforcer && !e->bmm_accepts_dropped);
+	datum_test(e->default_witness_commitment[0] == 0);
+	// The subsidy alone: the node's value carries fees this block will not.
+	datum_test(e->coinbasevalue == block_reward(996445) || e->coinbasevalue == 315200891ULL);
+	datum_test(e->coinbasevalue <= block_reward(996445) && e->coinbasevalue <= 315200891ULL);
+	
+	// A job on it, as update_stratum_job makes one: no bid, no accept, every coinbase safe, and
+	// coinbase 0 (what a client connecting meanwhile gets) pays only what the empty coinbase does.
+	static T_DATUM_STRATUM_JOB job;
+	memset(&job, 0, sizeof(job));
+	char saved_addr[sizeof(datum_config.mining_pool_address)];
+	memcpy(saved_addr, datum_config.mining_pool_address, sizeof(saved_addr));
+	strcpy(datum_config.mining_pool_address, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+	job.block_template = e;
+	job.height = e->height;
+	job.coinbase_value = e->coinbasevalue;
+	commitments_from_template(&job);
+	datum_job_note_bmm_request(&job);
+	datum_job_note_bmm_accept(&job);
+	generate_base_coinbase_txns_for_stratum_job(&job, true);
+	datum_test(job.commitments_count == 0 && !job.has_bmm_request && job.bmm_accepts == 0);
+	datum_test(datum_job_coinbase_is_safe(&job, 0));
+	int declared = -1, trailing = -1;
+	datum_test(coinb2_outputs(job.coinbase[0].coinb2, &declared, &trailing) == 1 && declared == 1 && trailing == 4);
+	datum_test(coinb2_outputs(job.subsidy_only_coinbase.coinb2, &declared, &trailing) == 1 && declared == 1);
+	char value_hex[17];
+	snprintf(value_hex, sizeof(value_hex), "%016llx", (unsigned long long)__builtin_bswap64(e->coinbasevalue));
+	datum_test(strstr(job.coinbase[0].coinb2, value_hex) != NULL);
+	memcpy(datum_config.mining_pool_address, saved_addr, sizeof(saved_addr));
+	
+	// A header that is itself broken gives nothing to build on: the old job stays.
+	j = json_loads("{\"height\":5,\"mintime\":1,\"curtime\":2,\"version\":1,\"sigoplimit\":1,"
+	               "\"sizelimit\":1,\"weightlimit\":1,\"bits\":\"1d00ffff\",\"transactions\":[]}", 0, &err);
+	if (datum_test(j != NULL)) {
+		datum_test(datum_gbt_header_template(j) == NULL);
+		json_decref(j);
+	}
+	
+	// When: at once on a new block; on the same block, a fresh empty job once per work
+	// update while on one, and a full job kept until its shares would go stale.
+	datum_test(datum_template_refusal_action(true, false, 0, 39000, 120000) == DATUM_REFUSAL_EMPTY_NEW_BLOCK);
+	datum_test(datum_template_refusal_action(true, true, 0, 39000, 120000) == DATUM_REFUSAL_EMPTY_NEW_BLOCK);
+	datum_test(datum_template_refusal_action(false, true, 250, 39000, 120000) == DATUM_REFUSAL_KEEP);
+	datum_test(datum_template_refusal_action(false, true, 40000, 39000, 120000) == DATUM_REFUSAL_EMPTY_REFRESH);
+	datum_test(datum_template_refusal_action(false, false, 80000, 39000, 120000) == DATUM_REFUSAL_KEEP);
+	datum_test(datum_template_refusal_action(false, false, 120000, 39000, 120000) == DATUM_REFUSAL_EMPTY_REFRESH);
+	printf("  a refused template for a new block still moves miners to it, on empty work\n");
+}
+
 void datum_blocktemplates_tests(void) {
+	a_refused_template_still_moves_miners_to_the_new_block();
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();
 	a_template_without_an_enforcer_drops_the_bmm_bids();

@@ -639,6 +639,153 @@ static bool gbt_rules_include(json_t *gbt, const char *rule) {
 	return false;
 }
 
+// The header fields of a template: what a block needs besides its
+// transactions and its coinbase. Shared by the full parser and by
+// datum_gbt_header_template, which builds empty work from them alone.
+static bool gbt_parse_header(json_t *gbt, T_DATUM_TEMPLATE_DATA *tdata) {
+	const char *s;
+	int i;
+	json_t *jval;
+	
+	tdata->height = json_integer_value(json_object_get(gbt, "height"));
+	if (!tdata->height) {
+		DLOG_ERROR("Missing data from GBT JSON (height)");
+		return false;
+	}
+	
+	tdata->mintime = json_integer_value(json_object_get(gbt, "mintime"));
+	if (!tdata->mintime) {
+		DLOG_ERROR("Missing data from GBT JSON (mintime)");
+		return false;
+	}
+	
+	tdata->sigoplimit = json_integer_value(json_object_get(gbt, "sigoplimit"));
+	if (!tdata->sigoplimit) {
+		DLOG_ERROR("Missing data from GBT JSON (sigoplimit)");
+		return false;
+	}
+	
+	tdata->curtime = json_integer_value(json_object_get(gbt, "curtime"));
+	if (!tdata->curtime) {
+		DLOG_ERROR("Missing data from GBT JSON (curtime)");
+		return false;
+	}
+	
+	tdata->sizelimit = json_integer_value(json_object_get(gbt, "sizelimit"));
+	if (!tdata->sizelimit) {
+		DLOG_ERROR("Missing data from GBT JSON (sizelimit)");
+		return false;
+	}
+	
+	tdata->weightlimit = json_integer_value(json_object_get(gbt, "weightlimit"));
+	if (!tdata->weightlimit) {
+		DLOG_ERROR("Missing data from GBT JSON (weightlimit)");
+		return false;
+	}
+	
+	tdata->version = json_integer_value(json_object_get(gbt, "version"));
+	if (!tdata->version) {
+		DLOG_ERROR("Missing data from GBT JSON (version)");
+		return false;
+	}
+	
+	jval = json_object_get(gbt, "bits");
+	if (json_string_length(jval) != 8) {
+		DLOG_ERROR("Wrong bits length from GBT JSON");
+		return false;
+	}
+	s = json_string_value(jval);
+	strcpy(tdata->bits, s);
+	
+	jval = json_object_get(gbt, "previousblockhash");
+	if (json_string_length(jval) != 64) {
+		DLOG_ERROR("Missing data from GBT JSON (previousblockhash)");
+		return false;
+	}
+	s = json_string_value(jval);
+	strcpy(tdata->previousblockhash, s);
+	
+	jval = json_object_get(gbt, "target");
+	if (json_string_length(jval) != 64) {
+		DLOG_ERROR("Missing data from GBT JSON (target)");
+		return false;
+	}
+	s = json_string_value(jval);
+	strcpy(tdata->block_target_hex, s);
+	
+	// "20000000", "192e17d5", "66256be5"
+	// version, bits, time
+	// 192e17d5 // gbt format matches stratum for bits
+	
+	// stash useful binary versions of prevblockhash and nbits
+	for(i=0;i<64;i+=2) {
+		tdata->previousblockhash_bin[31-(i>>1)] = hex2bin_uchar(&tdata->previousblockhash[i]);
+	}
+	for(i=0;i<4;i++) {
+		tdata->bits_bin[3-i] = hex2bin_uchar(&tdata->bits[i<<1]);
+	}
+	tdata->bits_uint = upk_u32le(tdata->bits_bin, 0);
+	nbits_to_target(tdata->bits_uint, tdata->block_target);
+	return true;
+}
+
+// Empty work for a block whose template was refused.
+//
+// A refusal (an enforcer template over 16383 transactions, a BMM accept with
+// no request, a malformed coinbasetxn, ...) used to keep the previous job, and
+// when the refused template was for a new block that left every miner hashing
+// on the block before -- work no node takes. The header is all a block needs
+// beside a coinbase: this is a template with the refused one's header fields,
+// no transactions, no commitments, no witness commitment, and a coinbase value
+// of the subsidy alone (what the subsidy-only coinbase of empty work pays). No
+// transactions means no BMM request, so no accept is owed; no commitments
+// means no vote that could be wrong. Whatever coinbase a client is given on
+// it, the block is valid.
+//
+// NULL if the header itself is missing or malformed: then there is nothing to
+// build on, and the previous job is kept as before.
+T_DATUM_TEMPLATE_DATA *datum_gbt_header_template(json_t *gbt) {
+	T_DATUM_TEMPLATE_DATA *tdata = get_next_template_ptr();
+	if (!tdata) {
+		DLOG_ERROR("Could not get a template pointer.");
+		return NULL;
+	}
+	if (!gbt_parse_header(gbt, tdata)) return NULL;
+	
+	tdata->coinbasevalue = block_reward(tdata->height);
+	{
+		// The node's value includes the fees of transactions this block will
+		// not carry; it can still only ever lower what the subsidy may claim.
+		const uint64_t declared = json_integer_value(json_object_get(gbt, "coinbasevalue"));
+		if (declared && declared < tdata->coinbasevalue) tdata->coinbasevalue = declared;
+	}
+	tdata->txn_count = 0;
+	tdata->commitments_count = 0;
+	tdata->bmm_accepts_dropped = false;
+	tdata->votable_known = false;
+	tdata->votable_count = 0;
+	tdata->from_enforcer = false;
+	tdata->default_witness_commitment[0] = 0;
+	return tdata;
+}
+
+// What the template thread does with a template the parser refused, given a
+// header template could be built from it (datum_gbt_header_template).
+//
+// A new block: empty work on it at once (DATUM_REFUSAL_EMPTY_NEW_BLOCK).
+// Already on empty work for this block: a fresh empty job once per work
+// update, so its shares do not go stale (DATUM_REFUSAL_EMPTY_REFRESH).
+// On full work for this block: kept while its shares are good, and empty work
+// once they would be going stale (DATUM_REFUSAL_EMPTY_REFRESH). The old block
+// is still valid, but its shares are refused as stale after
+// share_stale_seconds -- and each refused parse takes a slot of the template
+// ring that live jobs point into.
+int datum_template_refusal_action(bool new_block, bool on_empty_fallback, uint64_t ms_since_job, uint64_t refresh_ms, uint64_t stale_ms) {
+	if (new_block) return DATUM_REFUSAL_EMPTY_NEW_BLOCK;
+	if (on_empty_fallback) return (ms_since_job >= refresh_ms) ? DATUM_REFUSAL_EMPTY_REFRESH : DATUM_REFUSAL_KEEP;
+	return (ms_since_job >= stale_ms) ? DATUM_REFUSAL_EMPTY_REFRESH : DATUM_REFUSAL_KEEP;
+}
+
 T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	T_DATUM_TEMPLATE_DATA *tdata;
 	const char *s;
@@ -651,11 +798,7 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 		return NULL;
 	}
 	
-	tdata->height = json_integer_value(json_object_get(gbt, "height"));
-	if (!tdata->height) {
-		DLOG_ERROR("Missing data from GBT JSON (height)");
-		return NULL;
-	}
+	if (!gbt_parse_header(gbt, tdata)) return NULL;
 	
 	tdata->commitments_count = 0;
 	tdata->from_enforcer = false;
@@ -704,65 +847,6 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 			if (tdata->votable_known) tdata->votable_count = (int)json_array_size(votable);
 		}
 	}
-	tdata->mintime = json_integer_value(json_object_get(gbt, "mintime"));
-	if (!tdata->mintime) {
-		DLOG_ERROR("Missing data from GBT JSON (mintime)");
-		return NULL;
-	}
-	
-	tdata->sigoplimit = json_integer_value(json_object_get(gbt, "sigoplimit"));
-	if (!tdata->sigoplimit) {
-		DLOG_ERROR("Missing data from GBT JSON (sigoplimit)");
-		return NULL;
-	}
-	
-	tdata->curtime = json_integer_value(json_object_get(gbt, "curtime"));
-	if (!tdata->curtime) {
-		DLOG_ERROR("Missing data from GBT JSON (curtime)");
-		return NULL;
-	}
-	
-	tdata->sizelimit = json_integer_value(json_object_get(gbt, "sizelimit"));
-	if (!tdata->sizelimit) {
-		DLOG_ERROR("Missing data from GBT JSON (sizelimit)");
-		return NULL;
-	}
-	
-	tdata->weightlimit = json_integer_value(json_object_get(gbt, "weightlimit"));
-	if (!tdata->weightlimit) {
-		DLOG_ERROR("Missing data from GBT JSON (weightlimit)");
-		return NULL;
-	}
-	
-	tdata->version = json_integer_value(json_object_get(gbt, "version"));
-	if (!tdata->version) {
-		DLOG_ERROR("Missing data from GBT JSON (version)");
-		return NULL;
-	}
-	
-	jval = json_object_get(gbt, "bits");
-	if (json_string_length(jval) != 8) {
-		DLOG_ERROR("Wrong bits length from GBT JSON");
-		return NULL;
-	}
-	s = json_string_value(jval);
-	strcpy(tdata->bits, s);
-	
-	jval = json_object_get(gbt, "previousblockhash");
-	if (json_string_length(jval) != 64) {
-		DLOG_ERROR("Missing data from GBT JSON (previousblockhash)");
-		return NULL;
-	}
-	s = json_string_value(jval);
-	strcpy(tdata->previousblockhash, s);
-	
-	jval = json_object_get(gbt, "target");
-	if (json_string_length(jval) != 64) {
-		DLOG_ERROR("Missing data from GBT JSON (target)");
-		return NULL;
-	}
-	s = json_string_value(jval);
-	strcpy(tdata->block_target_hex, s);
 	
 	// A chain enforcing SegWit lists it among the template's rules and must
 	// send the commitment. One that turned it off (Bitcoin Cash II) sends
@@ -777,20 +861,6 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 		s = json_string_value(jval);
 		strcpy(tdata->default_witness_commitment, s);
 	}
-	
-	// "20000000", "192e17d5", "66256be5"
-	// version, bits, time
-	// 192e17d5 // gbt format matches stratum for bits
-	
-	// stash useful binary versions of prevblockhash and nbits
-	for(i=0;i<64;i+=2) {
-		tdata->previousblockhash_bin[31-(i>>1)] = hex2bin_uchar(&tdata->previousblockhash[i]);
-	}
-	for(i=0;i<4;i++) {
-		tdata->bits_bin[3-i] = hex2bin_uchar(&tdata->bits[i<<1]);
-	}
-	tdata->bits_uint = upk_u32le(tdata->bits_bin, 0);
-	nbits_to_target(tdata->bits_uint, tdata->block_target);
 	
 	// store binary default witness commitment
 	j = strlen(tdata->default_witness_commitment);
@@ -965,6 +1035,10 @@ void *datum_gateway_template_thread(void *args) {
 	int j;
 	T_DATUM_TEMPLATE_DATA *t;
 	bool was_notified = false;
+	// Whether the job miners are on is empty work over a refused template, and
+	// when this thread last made a job: see datum_template_refusal_action.
+	bool on_empty_fallback = false;
+	uint64_t last_job_ms = 0;
 	int wnc = 0;
 	uint64_t last_block_change = 0;
 	pthread_t pthread_datum_gateway_fallback_notifier;
@@ -1037,6 +1111,8 @@ void *datum_gateway_template_thread(void *args) {
 					if (new_block || notify_othercause) {
 						notify_othercause = 0;
 						update_stratum_job(t,true,JOB_STATE_EMPTY_PLUS);
+						on_empty_fallback = false;
+						last_job_ms = current_time_millis();
 						if (new_block) {
 							last_block_change = current_time_millis();
 							strcpy(p1, t->previousblockhash);
@@ -1063,6 +1139,7 @@ void *datum_gateway_template_thread(void *args) {
 						i = datum_stratum_v1_global_subscriber_count();
 						DLOG_INFO("Updating priority stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 						update_stratum_job(t,false,JOB_STATE_FULL_PRIORITY_WAIT_COINBASER);
+						last_job_ms = current_time_millis();
 					} else {
 						if (was_notified) {
 							// we got a notification of a new block, but there doesn't seem to actually be a new block.
@@ -1118,6 +1195,8 @@ void *datum_gateway_template_thread(void *args) {
 									DLOG_DEBUG("t->curtime = %llu", (unsigned long long)t->curtime);
 									
 									update_stratum_job(t,true,JOB_STATE_FULL_PRIORITY_WAIT_COINBASER);
+									on_empty_fallback = false;
+									last_job_ms = current_time_millis();
 									new_notify_blockhash[0] = 0;
 									was_notified = false;
 								}
@@ -1127,6 +1206,38 @@ void *datum_gateway_template_thread(void *args) {
 							i = datum_stratum_v1_global_subscriber_count();
 							DLOG_INFO("Updating standard stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 							update_stratum_job(t,false,JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
+							on_empty_fallback = false;
+							last_job_ms = current_time_millis();
+						}
+					}
+				} else {
+					// Refused (the parser said why). Keeping the previous job is
+					// right while it is on the same block and its shares are good;
+					// on a new block it leaves every miner on the block before.
+					// See datum_template_refusal_action and datum_gbt_header_template.
+					const char *ph = json_string_value(json_object_get(res_val, "previousblockhash"));
+					if (ph && strlen(ph) == 64) {
+						const uint64_t now = current_time_millis();
+						const uint64_t refresh_ms = ((uint64_t)datum_config.bitcoind_work_update_seconds - 1) * 1000;
+						const uint64_t stale_ms = (uint64_t)datum_config.stratum_v1_share_stale_seconds * 1000;
+						const bool new_block = strcmp(ph, p1) != 0;
+						const int action = datum_template_refusal_action(new_block, on_empty_fallback, now - last_job_ms, refresh_ms, stale_ms);
+						T_DATUM_TEMPLATE_DATA *e = (action == DATUM_REFUSAL_KEEP) ? NULL : datum_gbt_header_template(res_val);
+						if (e) datum_blocktemplates_error = "Template refused; serving empty work";
+						if (e && action == DATUM_REFUSAL_EMPTY_NEW_BLOCK) {
+							DLOG_WARN("Template for new block %s (%lu) refused; serving empty work on it until a template is taken.", e->previousblockhash, (unsigned long)e->height);
+							update_stratum_job(e, true, JOB_STATE_EMPTY_ONLY);
+							last_block_change = now;
+							strcpy(p1, e->previousblockhash);
+							was_notified = false;
+							on_empty_fallback = true;
+							last_job_ms = now;
+							DLOG_INFO("NEW NETWORK BLOCK: %s (%lu)", e->previousblockhash, (unsigned long)e->height);
+						} else if (e) {
+							DLOG_WARN("Template for block %lu refused again; %s empty work on it.", (unsigned long)e->height, on_empty_fallback ? "refreshing" : "switching to");
+							update_stratum_job(e, false, JOB_STATE_EMPTY_ONLY);
+							on_empty_fallback = true;
+							last_job_ms = now;
 						}
 					}
 				}

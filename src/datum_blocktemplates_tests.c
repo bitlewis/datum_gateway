@@ -683,6 +683,55 @@ static void pool_commitments_follow_chains_rules(void) {
 	printf("  one per slot whatever the push, no proposal twice, and pool payouts only to addresses\n");
 }
 
+// The pool's explicit-vector M4 with nothing to check it against -- no
+// drivechain_votable, no template M4 -- is not carried: the block abstains.
+static int pool_m4_carried(T_DATUM_TEMPLATE_DATA *tpl, const unsigned char *m4, int len) {
+	static T_DATUM_STRATUM_JOB job;
+	memset(&job, 0, sizeof(job));
+	job.block_template = tpl;
+	job.coinbase_value = 5000000000ULL;
+	unsigned char cb[256];
+	int n = 0;
+	cb[n++] = 0x80 | 0x01;
+	cb[n++] = 1;
+	cb[n++] = (unsigned char)len; cb[n++] = 0;
+	memcpy(&cb[n], m4, len); n += len;
+	datum_coinbaser_v2_parse(&job, cb, n, false);
+	for (int c = 0; c < job.commitments_count; c++) {
+		if (job.commitments[c].output_script_len == len && !memcmp(job.commitments[c].output_script, m4, len)) return 1;
+	}
+	return 0;
+}
+
+static void an_unchecked_pool_vote_is_not_carried(void) {
+	static T_DATUM_TEMPLATE_DATA tpl;
+	const unsigned char form1[] = { 0x6a, 0x06, 0xd7, 0x7d, 0x17, 0x76, 0x01, 0xff };
+	const unsigned char form2[] = { 0x6a, 0x07, 0xd7, 0x7d, 0x17, 0x76, 0x02, 0xff, 0xff };
+	const unsigned char leader[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x03 };
+	const unsigned char own[] = { 0x6a, 0x06, 0xd7, 0x7d, 0x17, 0x76, 0x01, 0xfe };
+	
+	// An enforcer template: no drivechain_votable, no M4 of its own.
+	memset(&tpl, 0, sizeof(tpl));
+	tpl.from_enforcer = true;
+	datum_test(!pool_m4_carried(&tpl, form1, sizeof(form1)));
+	datum_test(!pool_m4_carried(&tpl, form2, sizeof(form2)));
+	// No vector, nothing to get wrong.
+	datum_test(pool_m4_carried(&tpl, leader, sizeof(leader)));
+	
+	// The template votes on one sidechain: a one-entry vector agrees with it and replaces it.
+	memcpy(tpl.commitments[0].output_script, own, sizeof(own));
+	tpl.commitments[0].output_script_len = sizeof(own);
+	tpl.commitments_count = 1;
+	datum_test(pool_m4_carried(&tpl, form1, sizeof(form1)));
+	
+	// The node says there is one sidechain with no bundle pending: checked, and carried.
+	memset(&tpl, 0, sizeof(tpl));
+	tpl.votable_known = true;
+	tpl.votable_count = 1;
+	datum_test(pool_m4_carried(&tpl, form1, sizeof(form1)));
+	printf("  a pool vector vote with nothing to check it against is not carried\n");
+}
+
 static void a_malformed_pool_payload_leaves_the_template_whole(void) {
 	static T_DATUM_STRATUM_JOB job;
 	memset(&job, 0, sizeof(job));
@@ -1414,6 +1463,7 @@ void datum_blocktemplates_tests(void) {
 	a_template_with_its_own_accepts_ignores_the_pools();
 	a_malformed_pool_payload_leaves_the_template_whole();
 	pool_commitments_follow_chains_rules();
+	an_unchecked_pool_vote_is_not_carried();
 	the_output_count_matches_the_outputs_written();
 	commitments_are_packed_by_rank();
 	the_plain_coinbase_carries_commitments_and_the_empty_one_is_current();

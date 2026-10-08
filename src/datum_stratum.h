@@ -187,6 +187,12 @@ typedef struct {
 	T_DATUM_STRATUM_COINBASE coinbase[MAX_COINBASE_TYPES];
 	T_DATUM_STRATUM_COINBASE subsidy_only_coinbase;
 	int target_pot_index; // where in coinb1 do we put our per-user vardiff pot value?
+	// The coinbase input (BIP34 height, tags, unique ID with the PoT
+	// placeholder), as hex, built once with coinbase 0. Every other type is
+	// built from these bytes, so they all put the PoT byte where
+	// target_pot_index says, whatever the tags or the pool link do meanwhile.
+	char cb_input_hex[256];
+	int cb_input_sz;
 	
 	uint64_t coinbase_value;
 	uint64_t height;

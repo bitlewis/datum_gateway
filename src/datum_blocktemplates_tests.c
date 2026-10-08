@@ -1352,6 +1352,143 @@ static void a_link_flip_leaves_the_job_on_coinbase_0(void) {
 	printf("  after a link flip every type is coinbase 0, which is unchanged\n");
 }
 
+// A coinbase read as a node reads it: the whole of coinb1, an extranonce, and
+// coinb2 must be exactly one transaction with one input, whose scriptSig is
+// 2 to 100 bytes, and as many outputs as it declares. Returns the scriptSig
+// length, or -1. *outs gets the output count and *sum their total value.
+static int decode_coinbase(const T_DATUM_STRATUM_COINBASE *c, int *outs, uint64_t *sum) {
+	unsigned char tx[MAX_COINBASE_TXN_SIZE_BYTES];
+	if ((int)strlen(c->coinb1) != c->coinb1_len * 2 || (int)strlen(c->coinb2) != c->coinb2_len * 2) return -1;
+	const int n = c->coinb1_len + 12 + c->coinb2_len;
+	if (n > (int)sizeof(tx)) return -1;
+	memcpy(tx, c->coinb1_bin, c->coinb1_len);
+	memset(&tx[c->coinb1_len], 0x5a, 12);
+	memcpy(&tx[c->coinb1_len + 12], c->coinb2_bin, c->coinb2_len);
+	int p = 4;
+	if (tx[p++] != 1) return -1;                  // one input
+	p += 36;                                       // its prevout
+	const int sl = tx[p++];
+	if (sl < 2 || sl > 100) return -1;
+	p += sl + 4;                                   // scriptSig, sequence
+	if (p >= n || tx[p] >= 0xfd) return -1;
+	*outs = tx[p++];
+	*sum = 0;
+	for (int o = 0; o < *outs; o++) {
+		if (p + 9 > n) return -1;
+		uint64_t v = 0;
+		for (int b = 0; b < 8; b++) v |= (uint64_t)tx[p + b] << (8 * b);
+		*sum += v;
+		p += 8;
+		int l = tx[p++];
+		if (l == 0xfd) { l = tx[p] | (tx[p + 1] << 8); p += 2; }
+		p += l;
+	}
+	return (p + 4 == n) ? sl : -1;                 // and the lock time, then nothing
+}
+
+// A coinbase input over 85 bytes (long tags) leaves no room for the
+// extranonce in it: coinbase 0's coinb1 then runs past the sequence, with the
+// output count and the extranonce OP_RETURN. The coinbaser rebuilt coinb1 for
+// every type including 0, so coinbase 0 lost those bytes -- after it was
+// handed out -- and its lengths were reset and refilled under the stratum
+// threads. It is now only read: byte for byte what it was, and every type a
+// whole transaction.
+static void a_long_tag_leaves_coinbase_0_alone(void) {
+	static T_DATUM_STRATUM_JOB job;
+	static T_DATUM_TEMPLATE_DATA tpl;
+	static T_DATUM_STRATUM_COINBASE before0, before_sub;
+	char saved_addr[sizeof(datum_config.mining_pool_address)];
+	char saved_t1[sizeof(datum_config.mining_coinbase_tag_primary)], saved_t2[sizeof(datum_config.mining_coinbase_tag_secondary)];
+	memcpy(saved_addr, datum_config.mining_pool_address, sizeof(saved_addr));
+	memcpy(saved_t1, datum_config.mining_coinbase_tag_primary, sizeof(saved_t1));
+	memcpy(saved_t2, datum_config.mining_coinbase_tag_secondary, sizeof(saved_t2));
+	strcpy(datum_config.mining_pool_address, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+	
+	for (int pass = 0; pass < 4; pass++) {
+		const bool long_tags = pass < 2, with_commitments = (pass % 2) == 0;
+		memset(datum_config.mining_coinbase_tag_primary, 0, sizeof(saved_t1));
+		memset(datum_config.mining_coinbase_tag_secondary, 0, sizeof(saved_t2));
+		memset(datum_config.mining_coinbase_tag_primary, 'P', long_tags ? 60 : 5);
+		memset(datum_config.mining_coinbase_tag_secondary, 'S', long_tags ? 28 : 5);
+		memset(&job, 0, sizeof(job));
+		memset(&tpl, 0, sizeof(tpl));
+		memset(tpl.default_witness_commitment, 'a', 64);
+		tpl.sizelimit = 4000000;
+		tpl.weightlimit = 4000000;
+		job.block_template = &tpl;
+		job.height = 900000;
+		job.enprefix = 0x1234;
+		job.coinbase_value = 4 * 100000000ULL;
+		if (with_commitments) {
+			put_commitment(&job, HEX_M7);
+			put_commitment(&job, HEX_M4);
+		}
+		generate_base_coinbase_txns_for_stratum_job(&job, false);
+		datum_test(long_tags ? job.cb_input_sz > 85 : job.cb_input_sz <= 85);
+		memcpy(&before0, &job.coinbase[0], sizeof(before0));
+		memcpy(&before_sub, &job.subsidy_only_coinbase, sizeof(before_sub));
+		const int pot = job.target_pot_index;
+		datum_test(job.coinbase[0].coinb1_bin[pot] == 0xFF);
+		
+		// The tags change before the coinbaser lands: the job keeps its own input.
+		strcpy(datum_config.mining_coinbase_tag_primary, "changed");
+		generate_coinbase_txns_for_stratum_job(&job, false);
+		datum_test(memcmp(&before0, &job.coinbase[0], sizeof(before0)) == 0);
+		datum_test(memcmp(&before_sub, &job.subsidy_only_coinbase, sizeof(before_sub)) == 0);
+		datum_test(job.target_pot_index == pot);
+		
+		int outs = 0;
+		uint64_t sum = 0;
+		// Our output alone, and the extranonce's OP_RETURN when it is not in the input.
+		datum_test(decode_coinbase(&job.subsidy_only_coinbase, &outs, &sum) > 0 && outs == (long_tags ? 2 : 1));
+		for (int t = 0; t < MAX_COINBASE_TYPES; t++) {
+			const int sl = decode_coinbase(&job.coinbase[t], &outs, &sum);
+			if (!datum_test(sl > 0)) printf("    pass %d type %d\n", pass, t);
+			datum_test(sum == job.coinbase_value);
+			// one output at least besides the payout and the witness
+			// commitment where the extranonce is not in the input
+			if (!datum_test(outs >= 2 + (job.cb_input_sz > 85 || (t == 2 && with_commitments) ? 1 : 0) + (with_commitments ? 2 : 0))) printf("    pass %d type %d: %d outputs\n", pass, t, outs);
+			// The same input, and the PoT byte where target_pot_index says.
+			datum_test(memcmp(job.coinbase[t].coinb1_bin, job.coinbase[0].coinb1_bin, pot + 1) == 0 || t == 2);
+			datum_test(memcmp(&job.coinbase[t].coinb1_bin[42], &job.coinbase[0].coinb1_bin[42], job.cb_input_sz) == 0);
+			datum_test(job.coinbase[t].coinb1_bin[pot] == 0xFF);
+		}
+	}
+	
+	memcpy(datum_config.mining_pool_address, saved_addr, sizeof(saved_addr));
+	memcpy(datum_config.mining_coinbase_tag_primary, saved_t1, sizeof(saved_t1));
+	memcpy(datum_config.mining_coinbase_tag_secondary, saved_t2, sizeof(saved_t2));
+	printf("  with a coinbase input too long for the extranonce, coinbase 0 is left as handed out and every type decodes\n");
+}
+
+// The tags are cut to fit, never a reason to stop: a primary alone longer than
+// the room for tags used to panic the gateway, and dropping the secondary took
+// off one byte instead of the tag.
+static void a_tag_too_long_is_cut_not_fatal(void) {
+	char saved_t1[sizeof(datum_config.override_mining_coinbase_tag_primary)], saved_t2[sizeof(datum_config.mining_coinbase_tag_secondary)];
+	memcpy(saved_t1, datum_config.override_mining_coinbase_tag_primary, sizeof(saved_t1));
+	memcpy(saved_t2, datum_config.mining_coinbase_tag_secondary, sizeof(saved_t2));
+	char cb[512];
+	int pot = -1;
+	memset(datum_config.override_mining_coinbase_tag_primary, 0, sizeof(saved_t1));
+	memset(datum_config.override_mining_coinbase_tag_primary, 'O', 200);
+	strcpy(datum_config.mining_coinbase_tag_secondary, "sec");
+	int n = generate_coinbase_input(900000, cb, &pot, true);
+	datum_test(n <= 100 && pot > 0 && pot < n);
+	// 85 bytes of tag, its 0x00: the secondary is gone.
+	datum_test(hex2bin_uchar(&cb[8]) == 0x4c && hex2bin_uchar(&cb[10]) == 86);
+	datum_test(hex2bin_uchar(&cb[(6 + 85) * 2]) == 0x00);
+	// 85 of primary and 2 of secondary: the secondary goes, the primary fits whole.
+	memset(datum_config.override_mining_coinbase_tag_primary, 0, sizeof(saved_t1));
+	memset(datum_config.override_mining_coinbase_tag_primary, 'O', 85);
+	strcpy(datum_config.mining_coinbase_tag_secondary, "ab");
+	n = generate_coinbase_input(900000, cb, &pot, true);
+	datum_test(n <= 100 && hex2bin_uchar(&cb[10]) == 86 && hex2bin_uchar(&cb[(6 + 85) * 2]) == 0x00);
+	memcpy(datum_config.override_mining_coinbase_tag_primary, saved_t1, sizeof(saved_t1));
+	memcpy(datum_config.mining_coinbase_tag_secondary, saved_t2, sizeof(saved_t2));
+	printf("  a tag too long for the coinbase is cut, not fatal\n");
+}
+
 // A refused template for a new block used to keep the previous job, leaving
 // every miner on the block before. Its header is enough for empty work: a
 // block with no transactions, no commitments and the subsidy alone.
@@ -1440,6 +1577,8 @@ static void a_refused_template_still_moves_miners_to_the_new_block(void) {
 }
 
 void datum_blocktemplates_tests(void) {
+	a_long_tag_leaves_coinbase_0_alone();
+	a_tag_too_long_is_cut_not_fatal();
 	a_refused_template_still_moves_miners_to_the_new_block();
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();

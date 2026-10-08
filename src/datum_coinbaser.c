@@ -69,18 +69,19 @@ static inline int witness_outputs(const T_DATUM_STRATUM_JOB *s) {
 
 #define MAX_COINBASE_TAG_SPACE 86 // leaves space for BIP34 height, extranonces, datum prime tag, etc.
 
-int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
+// datum_active is the pool link state the caller read once for the whole
+// coinbase it is building: the tags, the unique ID's form and the payout
+// script all follow from it, and reading it again here could give a coinbase
+// input from one state and outputs from the other.
+int generate_coinbase_input(int height, char *cb, int *target_pot_index, bool datum_active) {
 	int cb_input_sz = 0;
 	int tag_len[2] = { 0, 0 };
 	int k, m, i;
 	int excess;
-	bool datum_active = false;
 	
 	// let's figure out our coinbase tags w/BIP34 height
 	i = append_bip34_height_hex(height, &cb[0]);
 	cb_input_sz += i>>1;
-	
-	datum_active = datum_protocol_is_active();
 	
 	// Handle coinbase tagging
 	// The first push after the height should be:
@@ -108,19 +109,23 @@ int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
 			tag_len[1] -= excess;
 			k = MAX_COINBASE_TAG_SPACE;
 		} else {
-			// not enough, so need to remove this tag entirely
+			// not enough, so need to remove this tag entirely: its bytes
+			// and the 0x0F separator go (counted before the length is
+			// cleared -- clearing it first took off one byte, not the tag).
 			if (tag_len[1]) {
+				k -= tag_len[1]+1;
 				tag_len[1] = 0;
-				k-=tag_len[1]+1;
 			}
 		}
 	}
 	
 	if (k > MAX_COINBASE_TAG_SPACE) {
-		// one tag should never exceed 64 bytes, so we're going to panic here.
-		DLOG_FATAL("Could not fit coinbase primary tag alone somehow. This is probably a bug. Panicking. :(");
-		panic_from_thread(__LINE__);
-		sleep(1000000);
+		// The primary tag alone does not fit. The pool sets it (configure
+		// refuses one this long, see datum_protocol_client_configure), and a
+		// tag is not worth stopping the gateway over: cut it to what fits.
+		DLOG_WARN("Coinbase primary tag of %d bytes does not fit; truncated to %d", tag_len[0], MAX_COINBASE_TAG_SPACE - 1);
+		tag_len[0] = MAX_COINBASE_TAG_SPACE - 1;
+		k = MAX_COINBASE_TAG_SPACE;
 	}
 	
 	if (k > 0) {
@@ -470,6 +475,16 @@ int datum_stratum_coinbase_fit_to_template(int max_sz, int fixed_bytes, T_DATUM_
 	}
 }
 
+static void coinbase_hex_to_bin(T_DATUM_STRATUM_COINBASE *c) {
+	int i, j;
+	i = strlen(c->coinb1);
+	for (j = 0; j < i; j += 2) c->coinb1_bin[j >> 1] = hex2bin_uchar(&c->coinb1[j]);
+	c->coinb1_len = i >> 1;
+	i = strlen(c->coinb2);
+	for (j = 0; j < i; j += 2) c->coinb2_bin[j >> 1] = hex2bin_uchar(&c->coinb2[j]);
+	c->coinb2_len = i >> 1;
+}
+
 // Coinbase 0, the plain one: the pool's (or our) output, the witness
 // commitment, and the commitments that fit the smallest coinbase a client
 // takes (type 1's); and, from the same start, the subsidy-only coinbase of
@@ -552,14 +567,51 @@ static void build_plain_coinbase(T_DATUM_STRATUM_JOB *s, bool space_for_en_in_co
 	sprintf(&sub->coinb2[sub2 + (k-j)], "00000000");
 	
 	// prep binary versions
-	T_DATUM_STRATUM_COINBASE *const built[2] = { &s->coinbase[0], sub };
-	for (int b = 0; b < 2; b++) {
-		i = strlen(built[b]->coinb1);
-		built[b]->coinb1_len = 0;
-		for (j = 0; j < i; j += 2) built[b]->coinb1_bin[built[b]->coinb1_len++] = hex2bin_uchar(&built[b]->coinb1[j]);
-		i = strlen(built[b]->coinb2);
-		built[b]->coinb2_len = 0;
-		for (j = 0; j < i; j += 2) built[b]->coinb2_bin[built[b]->coinb2_len++] = hex2bin_uchar(&built[b]->coinb2[j]);
+	coinbase_hex_to_bin(&s->coinbase[0]);
+	coinbase_hex_to_bin(sub);
+}
+
+// The start of a coinbase type's coinb1: the transaction up to the end of the
+// coinbase input, from the job's own input bytes (cb_input_hex, built with
+// coinbase 0). With the extranonce in the coinbase, that is the input's push
+// of it and the prefix; without, the input ends here and its sequence follows.
+// Returns the hex length written.
+static int coinb1_start(const T_DATUM_STRATUM_JOB *s, char *coinb1, bool en_in_coinbase) {
+	int idx = strlen(cbstart_hex);
+	memcpy(coinb1, cbstart_hex, idx);
+	// 15 bytes for extranonce+uid push + data
+	idx += append_bitcoin_varint_hex(s->cb_input_sz + (en_in_coinbase ? 15 : 0), &coinb1[idx]);
+	memcpy(&coinb1[idx], s->cb_input_hex, s->cb_input_sz * 2);
+	idx += s->cb_input_sz * 2;
+	if (en_in_coinbase) {
+		// if we are doing extranonce in the coinbase, then this is ALMOST the end of coinbase1
+		// we need a PUSH 14 and our enprefix in the coinbase
+		uchar_to_hex(&coinb1[idx], 0x0E);
+		idx += 2;
+		idx += sprintf(&coinb1[idx], "%04" PRIx16, s->enprefix);
+	} else {
+		// if we are not, then we need to append the "sequence"
+		pk_u64le(coinb1, idx, 0x6666666666666666ULL);  // "ffffffff"
+		idx += 8;
+	}
+	coinb1[idx] = 0;
+	return idx;
+}
+
+// The pool's script, or our own address's, for the link state the caller read.
+static void set_pool_addr_script(T_DATUM_STRATUM_JOB *s, bool datum_active) {
+	if (datum_active) {
+		// DATUM
+		s->pool_addr_script_len = datum_config.override_mining_pool_scriptsig_len;
+		if (s->pool_addr_script_len < 0 || s->pool_addr_script_len > (int)sizeof(s->pool_addr_script)) s->pool_addr_script_len = 0;
+		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptsig, s->pool_addr_script_len);
+	} else {
+		// No pool
+		s->pool_addr_script_len = addr_2_output_script(datum_config.mining_pool_address, &s->pool_addr_script[0], 64);
+	}
+	if (!s->pool_addr_script_len) {
+		DLOG_FATAL("Could not generate output script for pool addr! Perhaps invalid? This is bad.");
+		panic_from_thread(__LINE__);
 	}
 }
 
@@ -570,69 +622,36 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	// no node accepts.
 	(void)new_block;
 	char cb[512];
-	int cb_input_sz = 0;
-	bool space_for_en_in_coinbase = false;
-	int i, j, k;
 	int cb1idx[1] = { 0 };
 	int cb2idx[1] = { 0 };
 	int target_pot_index;
+	// Read once: the tags, the unique ID and the payout all follow from it.
+	const bool datum_active = datum_protocol_is_active();
 	
-	if (datum_protocol_is_active()) {
-		// DATUM
-		s->pool_addr_script_len = datum_config.override_mining_pool_scriptsig_len;
-		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptsig, datum_config.override_mining_pool_scriptsig_len);
-		s->is_datum_job = true;
-	} else {
-		// No pool
-		s->pool_addr_script_len = addr_2_output_script(datum_config.mining_pool_address, &s->pool_addr_script[0], 64);
-		s->is_datum_job = false;
-	}
-	if (!s->pool_addr_script_len) {
-		DLOG_FATAL("Could not generate output script for pool addr! Perhaps invalid? This is bad.");
-		panic_from_thread(__LINE__);
-	}
-	// copy beginning of the generation txn to the appropriate outputs
-	j = strlen(cbstart_hex);
-	memcpy(&s->coinbase[0].coinb1[0], cbstart_hex, j);
-	cb1idx[0] = j;
+	set_pool_addr_script(s, datum_active);
+	s->is_datum_job = datum_active;
 	
-	cb_input_sz = generate_coinbase_input(s->height, &cb[0], &target_pot_index);
-	i = cb_input_sz << 1;
+	s->cb_input_sz = generate_coinbase_input(s->height, &cb[0], &target_pot_index, datum_active);
+	cb[s->cb_input_sz << 1] = 0;
+	memcpy(s->cb_input_hex, cb, (s->cb_input_sz << 1) + 1);
 	
-	// null terminate... probably not needed
-	cb[i] = 0;
+	// we need 1 byte for the push, 2 for the enprefix, 4 for en1 and 8 for en2 = 15 bytes
+	// coinbase max is 100
+	const bool space_for_en_in_coinbase = (s->cb_input_sz <= 85);
 	
-	if (cb_input_sz <= 85) {
-		space_for_en_in_coinbase = true;
-	}
+	cb1idx[0] = coinb1_start(s, s->coinbase[0].coinb1, space_for_en_in_coinbase);
+	// Adjusted for placement in the txn: the 41 bytes before the input and its
+	// length, always one byte (the input is under 0xFD bytes). The same for
+	// every type, since every type starts with these bytes.
+	s->target_pot_index = target_pot_index + (int)(strlen(cbstart_hex) >> 1) + 1;
 	
-	if (space_for_en_in_coinbase) {
-		cb1idx[0] += append_bitcoin_varint_hex(cb_input_sz+15, &s->coinbase[0].coinb1[cb1idx[0]]); // 15 bytes for extranonce+uid push + data
-	} else {
-		cb1idx[0] += append_bitcoin_varint_hex(cb_input_sz, &s->coinbase[0].coinb1[cb1idx[0]]);
-	}
-	memcpy(&s->coinbase[0].coinb1[cb1idx[0]], &cb[0], cb_input_sz*2);
-	s->target_pot_index = target_pot_index + (cb1idx[0]>>1); // adjust for placement in the txn. always safe for all types, since the varint will always be 1 byte.
-	cb1idx[0] += cb_input_sz*2;
-	
-	if (space_for_en_in_coinbase) {
-		// if we are doing extranonce in the coinbase, then this is ALMOST the end of coinbase1
-		// we need a PUSH 14 and our enprefix in the coinbase
-		uchar_to_hex(&s->coinbase[0].coinb1[cb1idx[0]], 0x0E);
-		cb1idx[0]+=2;
-		// TODO: Profile a faster way to do this
-		cb1idx[0] += sprintf(&s->coinbase[0].coinb1[cb1idx[0]], "%04" PRIx16, s->enprefix);
-	} else {
-		// if we are not, then we need to append the "sequence"
-		pk_u64le(s->coinbase[0].coinb1, cb1idx[0], 0x6666666666666666ULL);  // "ffffffff"
-		cb1idx[0] += 8;
-	}
-	
-	s->coinbase[0].coinb1[cb1idx[0]] = 0;
-	
-	build_plain_coinbase(s, space_for_en_in_coinbase, cb_input_sz, cb1idx, cb2idx);
+	build_plain_coinbase(s, space_for_en_in_coinbase, s->cb_input_sz, cb1idx, cb2idx);
 }
 
+// Types 1 to 5, once the job's coinbaser has landed. Coinbase 0, the
+// subsidy-only coinbase, the coinbase input and target_pot_index were built
+// with the job and clients may already hold work on them: nothing here writes
+// them, and every type is built from the same input bytes.
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only) {
 	// Settled here because this is where every coinbase type is rebuilt, which
 	// is after the coinbaser has landed and the commitment set is whatever it
@@ -640,13 +659,15 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	//
 	// Each coinbase type says for itself how many accepts it carries.
 	datum_job_note_bmm_accept(s);
+	// Read once for the whole build.
+	const bool datum_active = datum_protocol_is_active();
 	// Coinbase 0 and the subsidy-only coinbase were built with the job and
 	// clients may already hold work on them: their bytes never change after
 	// (build_plain_coinbase is not called here). If the pool link changed
-	// since, the coinbase input -- and the PoT byte's place, one index for all
-	// types -- would differ between them and the types built now: the other
-	// types then stay copies of coinbase 0 for this job.
-	if (datum_protocol_is_active() != s->is_datum_job) {
+	// since, the payout -- and whether shares go to the pool at all
+	// (is_datum_job) -- would differ between them and the types built now:
+	// the other types then stay copies of coinbase 0 for this job.
+	if (datum_active != s->is_datum_job) {
 		DLOG_INFO("Pool link changed since job %d was made; it stays on its plain coinbase", s->global_index);
 		// Overwriting types 1 and up is safe here only because no client has
 		// work on them yet. Until this job's coinbaser lands (need_coinbaser
@@ -670,26 +691,16 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// With a minimum payout of 10 TBC, the largest likely coinbase as of height 840000 is around 16 KB if we paid every miner the minimum to a long address type.
 	// This seems highly unlikely.  16KB is more than sufficient.
 	
-	int i, j, k;
-	char cb[300];
-	int target_pot_index;
-	int cb_input_sz = 0;
-	
-	bool space_for_en_in_coinbase = false;
-	
+	int i;
 	int cb1idx[MAX_COINBASE_TYPES] = { 0,0,0,0,0,0 };
 	int cb2idx[MAX_COINBASE_TYPES] = { 0,0,0,0,0,0 };
-	
-	int cb_req_sz[MAX_COINBASE_TYPES] = { 0,0,0,0,0 };
+	int cb_req_sz[MAX_COINBASE_TYPES] = { 0,0,0,0,0,0 };
 	
 	////////////////
 	
 	// Initial mainnet coinbaser
-	if (datum_protocol_is_active()) {
-		// DATUM
-		s->pool_addr_script_len = datum_config.override_mining_pool_scriptsig_len;
-		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptsig, datum_config.override_mining_pool_scriptsig_len);
-		s->is_datum_job = true;
+	set_pool_addr_script(s, datum_active);
+	if (datum_active) {
 		// No payouts from the pool (it did not answer, or the value is below
 		// what it pays out): the plain coinbase pays the pool's address. With
 		// commitments, the sized types are built all the same -- paying the
@@ -697,9 +708,6 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		// plain coinbase would leave the template's BMM accepts and votes out.
 		empty_only = (s->available_coinbase_outputs_count == 0 && s->commitments_count == 0);
 	} else {
-		// No pool
-		s->pool_addr_script_len = addr_2_output_script(datum_config.mining_pool_address, &s->pool_addr_script[0], 64);
-		s->is_datum_job = false;
 		// Solo, the plain coinbase pays everything to our address, so every
 		// type can be a copy of it -- unless the template brought commitments.
 		// The plain coinbase has no room for them, and a copy of it would
@@ -708,31 +716,21 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		// the commitments.
 		empty_only = (s->commitments_count == 0);
 	}
-	if (!s->pool_addr_script_len) {
-		DLOG_FATAL("Could not generate output script for pool addr! Perhaps invalid? This is bad.");
-		panic_from_thread(__LINE__);
+	
+	if (empty_only) {
+		// Every type is coinbase 0, copied whole from its finished bytes:
+		// coinbase 0 itself is only read.
+		for (i = 1; i < MAX_COINBASE_TYPES; i++) {
+			memcpy(&s->coinbase[i], &s->coinbase[0], sizeof(s->coinbase[0]));
+		}
+		return;
 	}
 	
-	// copy beginning of the generation txn to the appropriate outputs
-	j = strlen(cbstart_hex);
-	for(i=0;i<MAX_COINBASE_TYPES;i++) {
-		memcpy(&s->coinbase[i].coinb1[0], cbstart_hex, j);
-		cb1idx[i] = j;
-	}
-	
-	cb_input_sz = generate_coinbase_input(s->height, &cb[0], &target_pot_index);
-	s->target_pot_index = target_pot_index;
-	i = cb_input_sz << 1;
-	
-	// null terminate... probably not needed
-	cb[i] = 0;
-	
+	const int cb_input_sz = s->cb_input_sz;
 	// do we have space in the coinbase for the extranonce for types that can do it this way?
 	// we need 1 byte for the push, 2 for the enprefix, 4 for en1 and 8 for en2 = 15 bytes
 	// coinbase max is 100
-	if (cb_input_sz <= 85) {
-		space_for_en_in_coinbase = true;
-	}
+	const bool space_for_en_in_coinbase = (cb_input_sz <= 85);
 	
 	// multiple coinbase options
 	// 0 = "empty" --- just pays pool addr, and possibly TIDES data.  extranonce in coinbase if fits, or in first output if not.
@@ -744,32 +742,8 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	
 	// only type 2 *needs* the OP_RETURN extranonce, unless the coinbase itself is too long
 	// set the len, and copy over the rest of the coinbase
-	for(i=0;i<MAX_COINBASE_TYPES;i++) {
-		if ((i!=2) && (space_for_en_in_coinbase)) {
-			cb1idx[i] += append_bitcoin_varint_hex(cb_input_sz+15, &s->coinbase[i].coinb1[cb1idx[i]]);
-		} else {
-			cb1idx[i] += append_bitcoin_varint_hex(cb_input_sz, &s->coinbase[i].coinb1[cb1idx[i]]);
-		}
-		memcpy(&s->coinbase[i].coinb1[cb1idx[i]], &cb[0], cb_input_sz*2);
-		// save this and adjust for placement in the txn... this is always safe because the coinbase input is always < 0xFD len
-		// little silly to set this multiple times, but it's fine for consistency.
-		s->target_pot_index = target_pot_index + (cb1idx[i]>>1);
-		cb1idx[i] += cb_input_sz*2;
-		
-		if ((i!=2) && (space_for_en_in_coinbase)) {
-			// if we are doing extranonce in the coinbase, then this is ALMOST the end of coinbase1
-			// we need a PUSH 14 and our enprefix in the coinbase
-			uchar_to_hex(&s->coinbase[i].coinb1[cb1idx[i]], 0x0E);
-			cb1idx[i]+=2;
-			// TODO: Profile a faster way to do this
-			cb1idx[i] += sprintf(&s->coinbase[i].coinb1[cb1idx[i]], "%04" PRIx16, s->enprefix);
-		} else {
-			// if we are not, then we need to append the "sequence"
-			pk_u64le(s->coinbase[i].coinb1, cb1idx[i], 0x6666666666666666ULL);  // "ffffffff"
-			cb1idx[i] += 8;
-		}
-		
-		s->coinbase[i].coinb1[cb1idx[i]] = 0;
+	for (i = 1; i < MAX_COINBASE_TYPES; i++) {
+		cb1idx[i] = coinb1_start(s, s->coinbase[i].coinb1, (i != 2) && space_for_en_in_coinbase);
 	}
 	
 	// extranonce ends up at the end of coinb1
@@ -778,79 +752,55 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// if extranonce in the coinbase, then we start coinb2 with the "sequence"
 	// if extranonce not in the coinbase, then we already tacked the "sequence" on to coinb1 immediately
 	
-	// we need to know the output count for each type so we can figure out what to stuff in each one
-	// this may be a bit wasteful, but needs to be done.  only needs to happen once per work update, and only when doing non-empty.
+	// ok, let's figure out how much space, if any, we have for miner payout outputs
+	// we first need to figure out how much space we are using for each type after required data, so let's do that
 	
-	if (empty_only) {
-		// copy empty coinbaser to the others
-		for (i=1;i<MAX_COINBASE_TYPES;i++) {
-			strcpy(s->coinbase[i].coinb1, s->coinbase[0].coinb1);
-			strcpy(s->coinbase[i].coinb2, s->coinbase[0].coinb2);
-			s->coinbase[i].accepts = s->coinbase[0].accepts;
-		}
+	// witness output = 46 bytes
+	// pool output = pool_addr_script_len + 9
+	// coinbase itself = cb_input_sz
+	// coinbase len = 1
+	// cbstart = 41 bytes
+	// lock time = 4 bytes
+	// "sequence" = 4 bytes
+	// extranonce size = 15 bytes (w/len push needed for either coinbase or OP_RETURN formats)
+	// output count... could technically be up to three bytes for types 3 + 4, most likely 1 byte for 0,1,2.
+	//     --- lets give ourselves the wiggle room and say 3 bytes
+	//
+	// total static bytes = 46+9+1+41+4+3+4+15 = 123 bytes
+	// not-static bytes = pool_addr_script_len + cb_input_sz + (space_for_en_in_coinbase?0:10)
+	//     --- it costs 10 extra bytes to do the OP_RETURN based extranonce
+	
+	if (!space_for_en_in_coinbase) {
+		cb_req_sz[1] = cb_req_sz[2] = cb_req_sz[3] = cb_req_sz[4] = cb_req_sz[5] = 119 + s->pool_addr_script_len + cb_input_sz + 10;
 	} else {
-		// ok, let's figure out how much space, if any, we have for miner payout outputs
-		// we first need to figure out how much space we are using for each type after required data, so let's do that
-		
-		// witness output = 46 bytes
-		// pool output = pool_addr_script_len + 9
-		// coinbase itself = cb_input_sz
-		// coinbase len = 1
-		// cbstart = 41 bytes
-		// lock time = 4 bytes
-		// "sequence" = 4 bytes
-		// extranonce size = 15 bytes (w/len push needed for either coinbase or OP_RETURN formats)
-		// output count... could technically be up to three bytes for types 3 + 4, most likely 1 byte for 0,1,2.
-		//     --- lets give ourselves the wiggle room and say 3 bytes
-		//
-		// total static bytes = 46+9+1+41+4+3+4+15 = 123 bytes
-		// not-static bytes = pool_addr_script_len + cb_input_sz + (space_for_en_in_coinbase?0:10)
-		//     --- it costs 10 extra bytes to do the OP_RETURN based extranonce
-		
-		if (!space_for_en_in_coinbase) {
-			cb_req_sz[1] = cb_req_sz[2] = cb_req_sz[3] = cb_req_sz[4] = cb_req_sz[5] = 119 + s->pool_addr_script_len + cb_input_sz + 10;
-		} else {
-			cb_req_sz[1] = cb_req_sz[2] = cb_req_sz[3] = cb_req_sz[4] = cb_req_sz[5] = 119 + s->pool_addr_script_len + cb_input_sz;
-			cb_req_sz[2] += 10; // always OP_RETURN extranonce for type 2
-		}
-		
-		// TYPE 1 - "Nicehash" friendly, max 500 bytes
-		i = datum_stratum_coinbase_fit_to_template(500, cb_req_sz[1], s);
-		generate_coinbase_txns_for_stratum_job_subtypebysize(s, 1, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
-		
-		// TYPE 3 - "Whatsminer" friendly, max 6500 bytes
-		i = datum_stratum_coinbase_fit_to_template(6500, cb_req_sz[3], s);
-		generate_coinbase_txns_for_stratum_job_subtypebysize(s, 3, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
-		
-		// TYPE 4 - "YUGE", max 16KB
-		i = datum_stratum_coinbase_fit_to_template(16000, cb_req_sz[4], s);
-		generate_coinbase_txns_for_stratum_job_subtypebysize(s, 4, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
-		
-		// TYPE 5 - "Antminer 2", max 2250 bytes
-		i = datum_stratum_coinbase_fit_to_template(2250, cb_req_sz[5], s);
-		generate_coinbase_txns_for_stratum_job_subtypebysize(s, 5, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
-		
-		// TYPE 2 - Older Antminer stock (S19)
-		i = datum_stratum_coinbase_fit_to_template(755, cb_req_sz[2], s);
-		generate_coinbase_txns_for_stratum_job_subtypebysize(s, 2, i, false, cb1idx, cb2idx, true);
+		cb_req_sz[1] = cb_req_sz[2] = cb_req_sz[3] = cb_req_sz[4] = cb_req_sz[5] = 119 + s->pool_addr_script_len + cb_input_sz;
+		cb_req_sz[2] += 10; // always OP_RETURN extranonce for type 2
 	}
+	
+	// TYPE 1 - "Nicehash" friendly, max 500 bytes
+	i = datum_stratum_coinbase_fit_to_template(500, cb_req_sz[1], s);
+	generate_coinbase_txns_for_stratum_job_subtypebysize(s, 1, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
+	
+	// TYPE 3 - "Whatsminer" friendly, max 6500 bytes
+	i = datum_stratum_coinbase_fit_to_template(6500, cb_req_sz[3], s);
+	generate_coinbase_txns_for_stratum_job_subtypebysize(s, 3, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
+	
+	// TYPE 4 - "YUGE", max 16KB
+	i = datum_stratum_coinbase_fit_to_template(16000, cb_req_sz[4], s);
+	generate_coinbase_txns_for_stratum_job_subtypebysize(s, 4, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
+	
+	// TYPE 5 - "Antminer 2", max 2250 bytes
+	i = datum_stratum_coinbase_fit_to_template(2250, cb_req_sz[5], s);
+	generate_coinbase_txns_for_stratum_job_subtypebysize(s, 5, i, space_for_en_in_coinbase, cb1idx, cb2idx, false);
+	
+	// TYPE 2 - Older Antminer stock (S19)
+	i = datum_stratum_coinbase_fit_to_template(755, cb_req_sz[2], s);
+	generate_coinbase_txns_for_stratum_job_subtypebysize(s, 2, i, false, cb1idx, cb2idx, true);
 	
 	// prep binary versions of the coinbase for speeding up later
-	for(k=0;k<MAX_COINBASE_TYPES;k++) {
-		i = strlen(s->coinbase[k].coinb1);
-		s->coinbase[k].coinb1_len = 0;
-		for(j=0;j<i;j+=2) {
-			s->coinbase[k].coinb1_bin[j>>1] = hex2bin_uchar(&s->coinbase[k].coinb1[j]);
-			s->coinbase[k].coinb1_len++;
-		}
-		i = strlen(s->coinbase[k].coinb2);
-		s->coinbase[k].coinb2_len = 0;
-		for(j=0;j<i;j+=2) {
-			s->coinbase[k].coinb2_bin[j>>1] = hex2bin_uchar(&s->coinbase[k].coinb2[j]);
-			s->coinbase[k].coinb2_len++;
-		}
+	for (i = 1; i < MAX_COINBASE_TYPES; i++) {
+		coinbase_hex_to_bin(&s->coinbase[i]);
 	}
-	
 }
 
 // Seed a job's commitments from its template.

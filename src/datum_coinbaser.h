@@ -40,6 +40,9 @@ int datum_coinbaser_init(void);
 void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s, int coinbase_index, int remaining_size, bool space_for_en_in_coinbase, int *cb1idx, int *cb2idx, bool special_coinb1);
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only);
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block);
+// The coinbase input as hex into cb (BIP34 height, tags, unique ID); its length
+// in bytes. *target_pot_index gets the PoT placeholder's offset within it.
+int generate_coinbase_input(int height, char *cb, int *target_pot_index, bool datum_active);
 // Whether a pool payout script is a standard address (P2PKH, P2SH, segwit).
 bool datum_payout_script_is_standard(const unsigned char *script, int len);
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free);

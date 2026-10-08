@@ -36,6 +36,7 @@
 #include "datum_utils.h"
 #include "datum_coinbaser.h"
 #include "datum_conf.h"
+#include "datum_protocol.h"
 
 // Build a coinbase transaction hex from a list of (value, scriptPubKey) pairs.
 // Segwit-serialised with a single input, which is what a template server sends.
@@ -1366,6 +1367,40 @@ static void the_plain_coinbase_carries_commitments_and_the_empty_one_is_current(
 	printf("  coinbase 0 carries the template's commitments, and it and the empty coinbase never change once handed out\n");
 }
 
+// The pool link changed between a job and its coinbaser: the other types
+// become copies of coinbase 0, which itself (and the empty coinbase) is left
+// exactly as handed out. Safe only because the types were not handed out yet
+// (see the comment at the copy).
+static void a_link_flip_leaves_the_job_on_coinbase_0(void) {
+	static T_DATUM_STRATUM_JOB job;
+	static T_DATUM_TEMPLATE_DATA tpl;
+	static T_DATUM_STRATUM_COINBASE before0, before_sub;
+	memset(&job, 0, sizeof(job));
+	memset(&tpl, 0, sizeof(tpl));
+	char saved_addr[sizeof(datum_config.mining_pool_address)];
+	memcpy(saved_addr, datum_config.mining_pool_address, sizeof(saved_addr));
+	strcpy(datum_config.mining_pool_address, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+	tpl.sizelimit = 4000000;
+	tpl.weightlimit = 4000000;
+	job.block_template = &tpl;
+	job.height = 900000;
+	job.coinbase_value = 4 * 100000000ULL;
+	generate_base_coinbase_txns_for_stratum_job(&job, false);
+	memcpy(&before0, &job.coinbase[0], sizeof(before0));
+	memcpy(&before_sub, &job.subsidy_only_coinbase, sizeof(before_sub));
+	// Made while the pool was up; the pool is down when the coinbaser lands.
+	datum_test(!datum_protocol_is_active());
+	job.is_datum_job = true;
+	generate_coinbase_txns_for_stratum_job(&job, false);
+	datum_test(memcmp(&before0, &job.coinbase[0], sizeof(before0)) == 0);
+	datum_test(memcmp(&before_sub, &job.subsidy_only_coinbase, sizeof(before_sub)) == 0);
+	for (int t = 1; t < MAX_COINBASE_TYPES; t++) {
+		datum_test(memcmp(&job.coinbase[t], &job.coinbase[0], sizeof(job.coinbase[0])) == 0);
+	}
+	memcpy(datum_config.mining_pool_address, saved_addr, sizeof(saved_addr));
+	printf("  after a link flip every type is coinbase 0, which is unchanged\n");
+}
+
 // A refused template for a new block used to keep the previous job, leaving
 // every miner on the block before. Its header is enough for empty work: a
 // block with no transactions, no commitments and the subsidy alone.
@@ -1466,6 +1501,7 @@ void datum_blocktemplates_tests(void) {
 	an_unchecked_pool_vote_is_not_carried();
 	the_output_count_matches_the_outputs_written();
 	commitments_are_packed_by_rank();
+	a_link_flip_leaves_the_job_on_coinbase_0();
 	the_plain_coinbase_carries_commitments_and_the_empty_one_is_current();
 	an_m4_of_the_wrong_length_is_recognised();
 	the_pool_vote_replaces_the_templates_vote_of_the_same_kind();

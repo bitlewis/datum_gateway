@@ -648,6 +648,17 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	// types then stay copies of coinbase 0 for this job.
 	if (datum_protocol_is_active() != s->is_datum_job) {
 		DLOG_INFO("Pool link changed since job %d was made; it stays on its plain coinbase", s->global_index);
+		// Overwriting types 1 and up is safe here only because no client has
+		// work on them yet. Until this job's coinbaser lands (need_coinbaser
+		// cleared just after this returns), send_mining_notify gives every
+		// client coinbase 0, so the job's other types are still whatever the
+		// job was made with, unused. The coinbaser thread calls this once per
+		// job. A second coinbaser on the same job, after its types were built
+		// and handed out, would rewrite bytes that clients are already hashing.
+		// That brings back the rewrite-after-handout bug (f828462, fixed in
+		// 484e050 for coinbase 0): shares on those types are checked against
+		// other bytes and rejected, and a block found on them is lost. The full
+		// rebuild below has the same constraint.
 		for (int t = 1; t < MAX_COINBASE_TYPES; t++) {
 			memcpy(&s->coinbase[t], &s->coinbase[0], sizeof(s->coinbase[0]));
 		}

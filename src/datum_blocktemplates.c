@@ -805,6 +805,9 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 	int i,j;
 	json_t *tx_array, *jval;
 	
+	bool truncated = false;
+	uint64_t truncated_fees = 0;
+	
 	tdata = get_next_template_ptr();
 	if (!tdata) {
 		DLOG_ERROR("Could not get a template pointer.");
@@ -906,7 +909,14 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 				return NULL;
 			}
 			DLOG_WARN("DATUM Gateway does not support blocks with more than 16383 transactions! %d txns in template. Truncating template to 16383 transactions.", (int)tdata->txn_count);
+			// The fees of what is left out are not this block's to claim:
+			// coinbasevalue counts them, and paying it whole is bad-cb-amount.
+			for (size_t t = 16383; t < json_array_size(tx_array); t++) {
+				const json_int_t f = json_integer_value(json_object_get(json_array_get(tx_array, t), "fee"));
+				if (f > 0) truncated_fees += (uint64_t)f;
+			}
 			tdata->txn_count = 16383;
+			truncated = true;
 		}
 		for(i=0;i<tdata->txn_count;i++) {
 			json_t *tx = json_array_get(tx_array, i);
@@ -977,6 +987,21 @@ T_DATUM_TEMPLATE_DATA *datum_gbt_parser(json_t *gbt) {
 			tdata->txn_total_weight+=tdata->txns[i].weight;
 			tdata->txn_total_size+=tdata->txns[i].size;
 			tdata->txn_total_sigops+=tdata->txns[i].sigops;
+		}
+	}
+	
+	if (truncated) {
+		if (truncated_fees > tdata->coinbasevalue) {
+			DLOG_ERROR("The transactions left out of a truncated template have %"PRIu64" sats of fees, more than its coinbase value %"PRIu64". Refusing it.",
+			           truncated_fees, tdata->coinbasevalue);
+			return NULL;
+		}
+		tdata->coinbasevalue -= truncated_fees;
+		// And the node's witness commitment covers the transactions left out:
+		// as it stands it is bad-witness-merkle-match.
+		if (!recompute_witness_commitment(tdata)) {
+			DLOG_ERROR("Could not recompute the witness commitment of a truncated template. Refusing it.");
+			return NULL;
 		}
 	}
 	

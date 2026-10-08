@@ -1665,6 +1665,57 @@ static void a_late_coinbaser_answer_is_not_taken_for_the_next_job(void) {
 	printf("  a late coinbaser answer for a job on another block is not taken for the next one\n");
 }
 
+// A template from a plain node over 16383 transactions is cut to the first
+// 16383. Its coinbasevalue still counted the fees of the rest (bad-cb-amount),
+// and its witness commitment still covered them (bad-witness-merkle-match).
+static void a_truncated_template_pays_and_commits_to_what_it_keeps(void) {
+	if (!datum_test(templates_ready())) return;
+	const int ntx = 16385;
+	const uint64_t value = 312500000ULL + 10ULL * 16383 + 777 + 555;
+	char *gbt = malloc(4096 + (size_t)ntx * 300);
+	if (!datum_test(gbt != NULL)) return;
+	int n = sprintf(gbt,
+	    "{\"height\":900000,\"coinbasevalue\":%llu,"
+	    "\"mintime\":1788470000,\"curtime\":1788470100,\"version\":536870912,\"sigoplimit\":80000,"
+	    "\"bits\":\"17034219\",\"sizelimit\":4000000,\"weightlimit\":4000000,"
+	    "\"previousblockhash\":\"0000000000000000e371b1e760aa93bcaa309f626beb59bff6c61f3e56443d48\","
+	    "\"target\":\"0000000000000000000342190000000000000000000000000000000000000000\","
+	    "\"default_witness_commitment\":\"6a24aa21a9ed1111111111111111111111111111111111111111111111111111111111111111\","
+	    "\"transactions\":[", (unsigned long long)value);
+	for (int i = 0; i < ntx; i++) {
+		const int fee = i < 16383 ? 10 : (i == 16383 ? 777 : 555);
+		n += sprintf(&gbt[n], "%s{\"txid\":\"%064x\",\"hash\":\"%064x\",\"data\":\"00\",\"fee\":%d,\"sigops\":0,\"weight\":4,\"depends\":[]}",
+		             i ? "," : "", i + 1, i + 1, fee);
+	}
+	strcpy(&gbt[n], "]}");
+	json_error_t err;
+	json_t *j = json_loads(gbt, 0, &err);
+	free(gbt);
+	if (!datum_test(j != NULL)) { printf("  (fixture: %s)\n", err.text); return; }
+	T_DATUM_TEMPLATE_DATA *t = datum_gbt_parser(j);
+	json_decref(j);
+	if (!datum_test(t != NULL)) return;
+	datum_test(t->txn_count == 16383);
+	datum_test(t->coinbasevalue == value - 777 - 555);
+	// The witness root over the coinbase (zero) and the 16383 kept: 16384 leaves.
+	static unsigned char tree[16384][32];
+	memset(tree[0], 0, 32);
+	for (int i = 0; i < 16383; i++) memcpy(tree[i + 1], t->txns[i].hash_bin, 32);
+	for (int count = 16384; count > 1; count >>= 1) {
+		for (int k = 0; k < count / 2; k++) double_sha256(tree[k], tree[2 * k], 64);
+	}
+	unsigned char buf[64], commit[32];
+	memcpy(buf, tree[0], 32);
+	memset(buf + 32, 0, 32);
+	double_sha256(commit, buf, 64);
+	char want[77] = "6a24aa21a9ed";
+	for (int b = 0; b < 32; b++) sprintf(&want[12 + 2 * b], "%02x", commit[b]);
+	if (!datum_test(!strcmp(t->default_witness_commitment, want))) {
+		printf("    got  %s\n    want %s\n", t->default_witness_commitment, want);
+	}
+	printf("  a truncated template pays and commits to only the transactions it keeps\n");
+}
+
 // A refused template for a new block used to keep the previous job, leaving
 // every miner on the block before. Its header is enough for empty work: a
 // block with no transactions, no commitments and the subsidy alone.
@@ -1758,6 +1809,7 @@ void datum_blocktemplates_tests(void) {
 	the_empty_coinbase_pays_what_the_template_allows();
 	a_pool_configuration_is_checked_before_it_is_taken();
 	a_late_coinbaser_answer_is_not_taken_for_the_next_job();
+	a_truncated_template_pays_and_commits_to_what_it_keeps();
 	a_refused_template_still_moves_miners_to_the_new_block();
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();

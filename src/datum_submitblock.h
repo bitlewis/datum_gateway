@@ -39,5 +39,6 @@
 void datum_submitblock_init(void);
 void datum_submitblock_trigger(const char *ptr, const char *hash);
 void datum_submitblock_waitfree(void);
+const char *datum_submitblock_pending(void);
 
 #endif

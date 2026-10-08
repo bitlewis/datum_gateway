@@ -793,25 +793,67 @@ bool datum_stratum_share_is_for_pool(const unsigned char *share_hash, uint64_t s
 // node. With the client's difficulty capped at the network's, every share on
 // a min-difficulty block is a block, and a rig sends thousands a second until
 // its new work arrives -- each one a synchronous submitblock on this thread,
-// which is what keeps that new work from arriving. Once the node has taken a
-// block on a previous block, another on the same one adds nothing (it is a
-// sibling the node never switches to); a stale job gets one try per previous
-// block, kept for the race the late block of our own can still win.
-bool datum_stratum_block_is_wanted(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job) {
-	if (!sdata || !sdata->last_block_tried) return true;
-	if (memcmp(sdata->last_block_prevhash, job->prevhash_bin, 32) != 0) return true;
-	if (sdata->last_block_accepted) return false;
-	return !job->is_stale_prevblock;
+// a disk write and a DATUM submit, which is what keeps that new work from
+// arriving.
+//
+// - The node took a block on this previous block (a confirmed accept, never a
+//   failed call: datum_submitblock_outcome): no more on it while the job is
+//   stale (the tip moved) or for DATUM_BLOCK_ACCEPT_HOLD_MS. If the gateway
+//   still sees that previous block as the tip after that, the block did not
+//   stick, and blocks on it are wanted again.
+// - A stale job gets one block per previous block the node answered, kept for
+//   the race the late block of our own can still win.
+// - After a block the node refused, or that never reached it, the next on the
+//   same job waits a backoff that doubles per miss (DATUM_BLOCK_RETRY_*_MS).
+//   Another job on the same previous block is not held back: a block the node
+//   did not take never stops the ones after it for long.
+static bool block_job_is_last(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job) {
+	return sdata->last_block_job == (const void *)job && sdata->last_block_job_tsms == job->tsms;
 }
 
-void datum_stratum_note_block_tried(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, bool accepted) {
+bool datum_stratum_block_is_wanted(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, uint64_t now_tsms) {
+	if (!sdata || !sdata->last_block_tried) return true;
+	if (memcmp(sdata->last_block_prevhash, job->prevhash_bin, 32) != 0) return true;
+	if (sdata->last_block_accepted) {
+		if (job->is_stale_prevblock) return false;
+		if (now_tsms < sdata->last_block_accepted_tsms + DATUM_BLOCK_ACCEPT_HOLD_MS) return false;
+	} else if (job->is_stale_prevblock && sdata->last_block_answered) {
+		return false;
+	}
+	if (block_job_is_last(sdata, job) && now_tsms < sdata->last_block_retry_tsms) return false;
+	return true;
+}
+
+void datum_stratum_note_block_tried(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, int outcome, uint64_t now_tsms) {
 	if (!sdata) return;
 	if (!sdata->last_block_tried || memcmp(sdata->last_block_prevhash, job->prevhash_bin, 32) != 0) {
 		memcpy(sdata->last_block_prevhash, job->prevhash_bin, 32);
 		sdata->last_block_tried = true;
+		sdata->last_block_answered = false;
 		sdata->last_block_accepted = false;
+		sdata->last_block_accepted_tsms = 0;
+		sdata->last_block_job = NULL;
+		sdata->last_block_job_tsms = 0;
+		sdata->last_block_misses = 0;
+		sdata->last_block_retry_tsms = 0;
 	}
-	if (accepted) sdata->last_block_accepted = true;
+	if (outcome != DATUM_SUBMITBLOCK_FAILED) sdata->last_block_answered = true;
+	if (outcome == DATUM_SUBMITBLOCK_ACCEPTED) {
+		sdata->last_block_accepted = true;
+		sdata->last_block_accepted_tsms = now_tsms;
+		sdata->last_block_misses = 0;
+		sdata->last_block_retry_tsms = 0;
+		return;
+	}
+	if (!block_job_is_last(sdata, job)) {
+		sdata->last_block_job = (const void *)job;
+		sdata->last_block_job_tsms = job->tsms;
+		sdata->last_block_misses = 0;
+	}
+	if (sdata->last_block_misses < 16) sdata->last_block_misses++;
+	uint64_t delay = (uint64_t)DATUM_BLOCK_RETRY_MIN_MS << (sdata->last_block_misses - 1);
+	if (delay > DATUM_BLOCK_RETRY_MAX_MS) delay = DATUM_BLOCK_RETRY_MAX_MS;
+	sdata->last_block_retry_tsms = now_tsms + delay;
 }
 
 void stratum_update_vardiff(T_DATUM_CLIENT_DATA *c, bool no_quick) {
@@ -1290,8 +1332,9 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	// most important thing to do right here is to check if the share is a block
 	// there's some downstream failures that can impact the share being valid, but at this point it's
 	// possible for this block to be valid.  even if it's stale or something we're going to try it.
-	if (compare_hashes(share_hash, job->block_target) <= 0 && !datum_stratum_block_is_wanted(m->sdata, job)) {
-		// A block on a previous block this thread already has a block on: see
+	if (compare_hashes(share_hash, job->block_target) <= 0 && !datum_stratum_block_is_wanted(m->sdata, job, current_time_millis())) {
+		// A block on a previous block this thread already has a block on, or
+		// held back after one the node did not take: see
 		// datum_stratum_block_is_wanted. It goes on as an ordinary share, and
 		// is not logged: there can be thousands of them a second.
 	} else if (compare_hashes(share_hash, job->block_target) <= 0) {
@@ -1308,8 +1351,8 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		DLOG_WARN("************************************************************************************************");
 		
 		i = assembleBlockAndSubmit(block_header, full_cb_txn, cb->coinb1_len+12+cb->coinb2_len, job, m->sdata, new_notify_blockhash, empty_work);
-		datum_stratum_note_block_tried(m->sdata, job, i != 0);
-		if (i) {
+		datum_stratum_note_block_tried(m->sdata, job, i, current_time_millis());
+		if (i == DATUM_SUBMITBLOCK_ACCEPTED) {
 			// successfully submitted
 			datum_blocktemplates_notifynew(new_notify_blockhash, job->height + 1);
 		}
@@ -2434,16 +2477,17 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	return;
 }
 
+// Returns a DATUM_SUBMITBLOCK_* outcome: only DATUM_SUBMITBLOCK_ACCEPTED is a
+// block the node has.
 int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t coinbase_txn_size, T_DATUM_STRATUM_JOB *job, T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const char *block_hash_hex, bool empty_work) {
 	// TODO: Also submit directly to bitcoin P2P
 	char *submitblock_req = NULL;
 	char *ptr = NULL;
 	size_t i;
-	json_t *r;
 	CURL *tcurl;
-	int ret = 0;
+	int ret = DATUM_SUBMITBLOCK_FAILED;
 	bool free_submitblock_req = false;
-	char *s = NULL;
+	char reason[256];
 	
 	// each thread has a chunk of RAM dedicated to prepping block submissions. use it.
 	submitblock_req = sdata->submitblock_req;
@@ -2458,7 +2502,7 @@ int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t 
 			// TODO: dump what we can to disk to preserve the block for any watchdog available there
 			// This should never happen, however, so super low priority... but to cover every contingency when a block is involved is eventually important to do.
 			panic_from_thread(__LINE__);
-			return 0;
+			return DATUM_SUBMITBLOCK_FAILED;
 		}
 		DLOG_ERROR("We were able to allocate a new block of RAM for submitting this block. But look into this issue. May be a hardware or OS problem!");
 		free_submitblock_req = true;
@@ -2533,33 +2577,24 @@ int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t 
 		// we're not going to panic here because our other thread might still pull off submitting it...
 		// these are cosmic ray rarity situations that should just never happen.
 		usleep(100000);
-		return 0;
+		return DATUM_SUBMITBLOCK_FAILED;
 	}
 	
-	// make the call!
-	r = bitcoind_json_rpc_call(tcurl, &datum_config, submitblock_req);
+	// make the call! Taken, refused, or no answer about it: only the first
+	// is a block the node has (datum_submitblock_outcome).
+	ret = bitcoind_submitblock(tcurl, &datum_config, NULL, submitblock_req, reason, sizeof(reason));
 	curl_easy_cleanup(tcurl);
-	if (!r) {
-		// oddly, this means success here.
-		DLOG_INFO("Block %s submitted to upstream node successfully!",block_hash_hex);
-		ret = 1;
+	if (ret == DATUM_SUBMITBLOCK_ACCEPTED) {
+		DLOG_INFO("Block %s submitted to upstream node successfully!%s%s", block_hash_hex, reason[0] ? " " : "", reason);
+	} else if (ret == DATUM_SUBMITBLOCK_REJECTED) {
+		DLOG_WARN("Upstream node rejected our block! (%s)", reason);
 	} else {
-		s = json_dumps(r, JSON_ENCODE_ANY);
-		if (!s) {
-			DLOG_WARN("Upstream node rejected our block! (unknown)");
-		} else {
-			DLOG_WARN("Upstream node rejected our block! (%s)",s);
-			free(s);
-		}
-		json_decref(r);
-		ret = 0;
+		DLOG_WARN("Could not submit our block %s to the upstream node: %s", block_hash_hex, reason);
 	}
 	
 	// cleanup
 	if (free_submitblock_req) {
-		// let's not free until our thread is done with it
-		usleep(10000);
-		datum_submitblock_waitfree();
+		// the submit thread has its own copy (datum_submitblock_trigger)
 		free(submitblock_req);
 	}
 	

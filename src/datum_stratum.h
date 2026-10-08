@@ -230,10 +230,18 @@ typedef struct T_DATUM_STRATUM_THREADPOOL_DATA {
 	uint64_t next_kick_check_tsms;
 	
 	// The last block this thread handed to the node: the previous block it
-	// builds on, and whether the node took it. See datum_stratum_block_is_wanted.
+	// builds on, whether the node answered and whether it took one, and the
+	// backoff after blocks it did not take, per job on that previous block.
+	// See datum_stratum_block_is_wanted.
 	unsigned char last_block_prevhash[32];
 	bool last_block_tried;
+	bool last_block_answered;
 	bool last_block_accepted;
+	uint64_t last_block_accepted_tsms;
+	const void *last_block_job;
+	uint64_t last_block_job_tsms;
+	int last_block_misses;
+	uint64_t last_block_retry_tsms;
 	
 	char submitblock_req[MAX_SUBMITBLOCK_SIZE];
 	
@@ -337,8 +345,14 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c);
 uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap);
 bool datum_stratum_share_is_for_pool(const unsigned char *share_hash, uint64_t sent_diff, uint64_t pool_diff);
-bool datum_stratum_block_is_wanted(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job);
-void datum_stratum_note_block_tried(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, bool accepted);
+// How long a block the node took on a previous block holds off more on it
+// while the gateway still sees that previous block as the tip; and the backoff
+// after blocks it did not take, doubling per miss on one job.
+#define DATUM_BLOCK_ACCEPT_HOLD_MS 5000
+#define DATUM_BLOCK_RETRY_MIN_MS 250
+#define DATUM_BLOCK_RETRY_MAX_MS 8000
+bool datum_stratum_block_is_wanted(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, uint64_t now_tsms);
+void datum_stratum_note_block_tried(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const T_DATUM_STRATUM_JOB *job, int outcome, uint64_t now_tsms);
 bool stratum_latest_empty_check_ready_for_full(void);
 
 // Server thread main loop

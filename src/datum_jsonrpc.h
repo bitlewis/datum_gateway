@@ -68,5 +68,13 @@ char *basic_http_call(CURL *curl, const char *url);
 bool update_rpc_cookie(global_config_t *cfg);
 void update_rpc_auth(global_config_t *cfg);
 json_t *bitcoind_json_rpc_call(CURL *curl, global_config_t *cfg, const char *rpc_req);
+char *json_rpc_call_raw(CURL *curl, const char *url, const char *userpass, const char *rpc_req, long *http_code);
+
+// What became of a submitblock (datum_submitblock_outcome).
+#define DATUM_SUBMITBLOCK_FAILED   0 // no answer about the block: transport, HTTP or RPC error, unreadable reply
+#define DATUM_SUBMITBLOCK_REJECTED 1 // the node refused it, and said why
+#define DATUM_SUBMITBLOCK_ACCEPTED 2 // the node took it (or already had it, valid)
+int datum_submitblock_outcome(long http_code, const char *body, char *reason, size_t reason_sz);
+int bitcoind_submitblock(CURL *curl, global_config_t *cfg, const char *url, const char *rpc_req, char *reason, size_t reason_sz);
 
 #endif

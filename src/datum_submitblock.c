@@ -33,6 +33,8 @@
  *
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <curl/curl.h>
@@ -46,7 +48,7 @@
 pthread_mutex_t submitblock_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t submitblock_cond = PTHREAD_COND_INITIALIZER;
 int submit_block_triggered = 0;
-const char *submitblock_ptr = NULL;
+char *submitblock_ptr = NULL;
 char submitblock_hash[256] = { 0 };
 
 // preciousblock tells a node to prefer our block when two race at one height.
@@ -72,26 +74,15 @@ void preciousblock(CURL *curl, const char *url, char *blockhash) {
 }
 
 void datum_submitblock_doit(CURL *tcurl, char *url, const char *submitblock_req, const char *block_hash_hex) {
-	json_t *r;
-	char *s = NULL;
+	char reason[256];
 	// TODO: Move these types of things to the conf file
-	if (!url) {
-		r = bitcoind_json_rpc_call(tcurl, &datum_config, submitblock_req);
+	const int outcome = bitcoind_submitblock(tcurl, &datum_config, url, submitblock_req, reason, sizeof(reason));
+	if (outcome == DATUM_SUBMITBLOCK_ACCEPTED) {
+		DLOG_INFO("Block %s submitted to upstream node successfully!%s%s", block_hash_hex, reason[0] ? " " : "", reason);
+	} else if (outcome == DATUM_SUBMITBLOCK_REJECTED) {
+		DLOG_WARN("Upstream node rejected our block! (%s)", reason);
 	} else {
-		r = json_rpc_call(tcurl, url, NULL, submitblock_req);
-	}
-	if (!r) {
-		// oddly, this means success here.
-		DLOG_INFO("Block %s submitted to upstream node successfully!",block_hash_hex);
-	} else {
-		s = json_dumps(r, JSON_ENCODE_ANY);
-		if (!s) {
-			DLOG_WARN("Upstream node rejected our block! (unknown)");
-		} else {
-			DLOG_WARN("Upstream node rejected our block! (%s)",s);
-			free(s);
-		}
-		json_decref(r);
+		DLOG_WARN("Could not submit our block %s: %s", block_hash_hex, reason);
 	}
 	
 	// precious block, to the same place the block went.
@@ -101,6 +92,8 @@ void datum_submitblock_doit(CURL *tcurl, char *url, const char *submitblock_req,
 void *datum_submitblock_thread(void *ptr) {
 	CURL *tcurl = NULL;
 	int i;
+	char *req;
+	char hash[sizeof(submitblock_hash)];
 	
 	tcurl = curl_easy_init();
 	if (!tcurl) {
@@ -111,67 +104,66 @@ void *datum_submitblock_thread(void *ptr) {
 	DLOG_DEBUG("Submitblock thread active");
 	
 	while (1) {
-		// Lock the mutex before waiting on the condition variable
 		pthread_mutex_lock(&submitblock_mutex);
-		
-		// Wait for the event to be triggered
 		while (!submit_block_triggered) {
 			pthread_cond_wait(&submitblock_cond, &submitblock_mutex);
 		}
+		// Ours now: the submission is our own copy, taken under the lock and
+		// worked on without it, so the next block can be queued meanwhile.
+		req = submitblock_ptr;
+		submitblock_ptr = NULL;
+		memcpy(hash, submitblock_hash, sizeof(hash));
+		submit_block_triggered = 0;
+		pthread_mutex_unlock(&submitblock_mutex);
 		
-		if (submitblock_ptr != NULL) {
+		if (req != NULL) {
 			DLOG_DEBUG("SUBMITTING BLOCK TO OUR NODE!");
 			
-			datum_submitblock_doit(tcurl,NULL,submitblock_ptr,submitblock_hash);
+			datum_submitblock_doit(tcurl,NULL,req,hash);
 			
 			if (datum_config.extra_block_submissions_count > 0) {
 				for(i=0;i<datum_config.extra_block_submissions_count;i++) {
 					DLOG_DEBUG("SUBMITTING BLOCK TO EXTRA NODE %d!",i+1);
-					datum_submitblock_doit(tcurl,(char *)datum_config.extra_block_submissions_urls[i],submitblock_ptr,submitblock_hash);
+					datum_submitblock_doit(tcurl,(char *)datum_config.extra_block_submissions_urls[i],req,hash);
 				}
 			}
+			free(req);
 		}
-		
-		// Reset the event flag
-		submit_block_triggered = 0;
-		
-		// Unlock the mutex after processing
-		pthread_mutex_unlock(&submitblock_mutex);
 	}
 	
 	return NULL;
 }
 
 void datum_submitblock_waitfree(void) {
+	// The thread works on its own copy (datum_submitblock_trigger): nothing of
+	// the caller's is held. Kept for callers that wait anyway.
 	pthread_mutex_lock(&submitblock_mutex);
-	DLOG_DEBUG("DEBUG: Lock acquired.");
 	pthread_mutex_unlock(&submitblock_mutex);
 }
 
+// The submission the thread has queued and not yet taken, or NULL. For the tests.
+const char *datum_submitblock_pending(void) {
+	return submitblock_ptr;
+}
+
 void datum_submitblock_trigger(const char *ptr, const char *hash) {
-	// Lock the mutex before updating and triggering the event
-	
-	int i;
-	for(i=0;i<100;i++) {
-		if (pthread_mutex_trylock(&submitblock_mutex) == 0) {
-			// Update the shared data
-			submitblock_ptr = ptr;
-			strcpy(submitblock_hash, hash);
-			
-			// Set the event flag and signal the condition variable
-			submit_block_triggered = 1;
-			pthread_cond_signal(&submitblock_cond);
-			
-			// Unlock the mutex
-			pthread_mutex_unlock(&submitblock_mutex);
-			return;
-		}
-		
-		usleep(1000);
+	// The thread gets its own copy. Handed the caller's buffer -- the stratum
+	// thread's submitblock_req -- it read it while the next block found on that
+	// thread was written over it, and submitted a mix of the two.
+	char *copy = strdup(ptr);
+	if (!copy) {
+		DLOG_ERROR("Could not copy a block for the submit thread; the stratum thread still submits it.");
+		return;
 	}
-	
-	DLOG_ERROR("Could not acquire a lock on the submitblock thread after 100ms! This might be bad!");
-	return;
+	pthread_mutex_lock(&submitblock_mutex);
+	// One not yet taken is superseded, as it always was; the stratum thread
+	// submits every block itself as well.
+	free(submitblock_ptr);
+	submitblock_ptr = copy;
+	snprintf(submitblock_hash, sizeof(submitblock_hash), "%s", hash);
+	submit_block_triggered = 1;
+	pthread_cond_signal(&submitblock_cond);
+	pthread_mutex_unlock(&submitblock_mutex);
 }
 
 void datum_submitblock_init(void) {

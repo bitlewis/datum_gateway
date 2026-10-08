@@ -42,6 +42,7 @@
 #include "datum_stratum.h"
 #include "datum_conf.h"
 #include "datum_utils.h"
+#include "datum_submitblock.h"
 
 void datum_stratum_mod_username_tests() {
 	const char * const s_umods = "{\"x\":{\"addrA\": 0.3}, \"abc\":{\"addrB\":0.3,\"addrC\":0.3},\":)\":{\"\":0.5}}";
@@ -379,27 +380,119 @@ static void the_client_difficulty_never_exceeds_the_networks(void) {
 	datum_test(!memcmp(m->quickdiff_target, t, 32));
 	printf("  a client is sent difficulty 1 on a min-difficulty block and its own on the next, the PoT byte unchanged\n");
 	
-	// Blocks: one per previous block once the node has one; a stale job one try.
-	datum_test(datum_stratum_block_is_wanted(sd, &jmin));
-	datum_stratum_note_block_tried(sd, &jmin, false);
-	datum_test(datum_stratum_block_is_wanted(sd, &jmin));      // the node refused it: try another
-	jmin.is_stale_prevblock = true;
-	datum_test(!datum_stratum_block_is_wanted(sd, &jmin));     // stale, and already tried once
-	jmin.is_stale_prevblock = false;
-	datum_stratum_note_block_tried(sd, &jmin, true);
-	datum_test(!datum_stratum_block_is_wanted(sd, &jmin));     // the node has one on this previous block
-	memset(jmain.prevhash_bin, 0x22, 32);
-	datum_test(datum_stratum_block_is_wanted(sd, &jmain));     // another previous block
-	datum_stratum_note_block_tried(sd, &jmain, false);
-	jmain.is_stale_prevblock = true;
-	datum_test(!datum_stratum_block_is_wanted(sd, &jmain));
-	datum_test(datum_stratum_block_is_wanted(sd, &jmin));      // only the last one is remembered
-	printf("  once the node has a block on a previous block, no more are submitted on it\n");
-	
 	free(m); free(c); free(sd); free(td);
 }
 
+// What a submitblock reply says. json_rpc_call returned NULL for a block taken
+// and for every failure alike -- a timeout, an HTTP error, a JSON-RPC error,
+// a reply that does not parse -- and the gateway called all of them success.
+static void a_submitblock_reply_is_read_for_what_it_says(void) {
+	char r[256];
+	datum_test(datum_submitblock_outcome(200, "{\"result\":null,\"error\":null,\"id\":\"1\"}", r, sizeof(r)) == DATUM_SUBMITBLOCK_ACCEPTED);
+	datum_test(datum_submitblock_outcome(200, "{\"jsonrpc\":\"2.0\",\"result\":null,\"id\":\"1\"}", r, sizeof(r)) == DATUM_SUBMITBLOCK_ACCEPTED);
+	// Already there and valid: the submit thread often gets it in first.
+	datum_test(datum_submitblock_outcome(200, "{\"result\":\"duplicate\",\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_ACCEPTED);
+	datum_test(datum_submitblock_outcome(200, "{\"result\":\"bad-cb-amount\",\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_REJECTED && !strcmp(r, "bad-cb-amount"));
+	datum_test(datum_submitblock_outcome(200, "{\"result\":\"inconclusive\",\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_REJECTED);
+	datum_test(datum_submitblock_outcome(200, "{\"result\":\"duplicate-invalid\",\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_REJECTED);
+	// None of these says anything about the block.
+	datum_test(datum_submitblock_outcome(-1, NULL, r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);                       // timeout, refused connection
+	datum_test(datum_submitblock_outcome(500, "{\"result\":null,\"error\":{\"code\":-22,\"message\":\"Block decode failed\"}}", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	datum_test(strstr(r, "Block decode failed") != NULL);
+	datum_test(datum_submitblock_outcome(200, "{\"result\":null,\"error\":{\"code\":-32603,\"message\":\"x\"}}", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	datum_test(datum_submitblock_outcome(401, "", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	datum_test(datum_submitblock_outcome(503, "{\"result\":null,\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	datum_test(datum_submitblock_outcome(200, "<html>proxy error</html>", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	datum_test(datum_submitblock_outcome(200, "{\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);  // no result at all
+	datum_test(datum_submitblock_outcome(200, "{\"result\":true,\"error\":null}", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	datum_test(datum_submitblock_outcome(200, "[null]", r, sizeof(r)) == DATUM_SUBMITBLOCK_FAILED);
+	printf("  a submitblock reply is a block taken only when the node says so\n");
+}
+
+// Which blocks a stratum thread hands to the node, with the clock given.
+static void only_a_block_the_node_took_holds_back_the_next(void) {
+	T_DATUM_STRATUM_THREADPOOL_DATA *sd = calloc(1, sizeof(*sd));
+	static T_DATUM_STRATUM_JOB j1, j2, jo;
+	if (!datum_test(sd != NULL)) return;
+	memset(&j1, 0, sizeof(j1)); memset(&j2, 0, sizeof(j2)); memset(&jo, 0, sizeof(jo));
+	memset(j1.prevhash_bin, 0x11, 32); j1.tsms = 1000;
+	memset(j2.prevhash_bin, 0x11, 32); j2.tsms = 2000;
+	memset(jo.prevhash_bin, 0x22, 32); jo.tsms = 3000;
+	uint64_t now = 100000;
+	
+	datum_test(datum_stratum_block_is_wanted(sd, &j1, now));
+	// The call failed (timeout, HTTP error, RPC error): nothing is known about
+	// the block. It does not stop blocks on the previous block -- only the
+	// same job waits a moment, so a dead node is not asked a thousand times a second.
+	datum_stratum_note_block_tried(sd, &j1, DATUM_SUBMITBLOCK_FAILED, now);
+	datum_test(!datum_stratum_block_is_wanted(sd, &j1, now + 1));
+	datum_test(datum_stratum_block_is_wanted(sd, &j2, now + 1));          // another job on the same previous block
+	datum_test(datum_stratum_block_is_wanted(sd, &j1, now + DATUM_BLOCK_RETRY_MIN_MS));
+	// A stale job after a failed call: still wanted once the backoff is over.
+	j1.is_stale_prevblock = true;
+	datum_test(datum_stratum_block_is_wanted(sd, &j1, now + DATUM_BLOCK_RETRY_MIN_MS));
+	j1.is_stale_prevblock = false;
+	
+	// Refused, again and again on one job: the wait doubles, up to its cap.
+	now += 1000;
+	datum_stratum_note_block_tried(sd, &j1, DATUM_SUBMITBLOCK_REJECTED, now);  // second miss on j1
+	datum_test(!datum_stratum_block_is_wanted(sd, &j1, now + 2 * DATUM_BLOCK_RETRY_MIN_MS - 1));
+	datum_test(datum_stratum_block_is_wanted(sd, &j1, now + 2 * DATUM_BLOCK_RETRY_MIN_MS));
+	for (int k = 0; k < 10; k++) datum_stratum_note_block_tried(sd, &j1, DATUM_SUBMITBLOCK_REJECTED, now);
+	datum_test(!datum_stratum_block_is_wanted(sd, &j1, now + DATUM_BLOCK_RETRY_MAX_MS - 1));
+	datum_test(datum_stratum_block_is_wanted(sd, &j1, now + DATUM_BLOCK_RETRY_MAX_MS));
+	datum_test(datum_stratum_block_is_wanted(sd, &j2, now));               // the other job is not held back
+	// The node answered on this previous block: a stale job gets no more.
+	j1.is_stale_prevblock = true;
+	datum_test(!datum_stratum_block_is_wanted(sd, &j1, now + 60000));
+	j1.is_stale_prevblock = false;
+	
+	// The node took one: no more on that previous block for a while, on any job.
+	now += 60000;
+	datum_stratum_note_block_tried(sd, &j2, DATUM_SUBMITBLOCK_ACCEPTED, now);
+	datum_test(!datum_stratum_block_is_wanted(sd, &j1, now + 1));
+	datum_test(!datum_stratum_block_is_wanted(sd, &j2, now + DATUM_BLOCK_ACCEPT_HOLD_MS - 1));
+	datum_test(datum_stratum_block_is_wanted(sd, &jo, now + 1));          // another previous block
+	// The tip moved (the job is stale): none on it, however long.
+	j2.is_stale_prevblock = true;
+	datum_test(!datum_stratum_block_is_wanted(sd, &j2, now + 600000));
+	j2.is_stale_prevblock = false;
+	// The tip is still on that previous block after the hold: the block did not stick. Again.
+	datum_test(datum_stratum_block_is_wanted(sd, &j2, now + DATUM_BLOCK_ACCEPT_HOLD_MS));
+	// ... and refused this time: the backoff, not the old accept, decides.
+	datum_stratum_note_block_tried(sd, &j2, DATUM_SUBMITBLOCK_REJECTED, now + DATUM_BLOCK_ACCEPT_HOLD_MS);
+	datum_test(!datum_stratum_block_is_wanted(sd, &j2, now + DATUM_BLOCK_ACCEPT_HOLD_MS + 1));
+	datum_test(datum_stratum_block_is_wanted(sd, &j2, now + DATUM_BLOCK_ACCEPT_HOLD_MS + DATUM_BLOCK_RETRY_MIN_MS));
+	
+	// A new previous block starts afresh; a job slot reused for a new job is a new job.
+	datum_stratum_note_block_tried(sd, &jo, DATUM_SUBMITBLOCK_REJECTED, now);
+	datum_test(!datum_stratum_block_is_wanted(sd, &jo, now + 1));
+	jo.tsms = 4000;
+	datum_test(datum_stratum_block_is_wanted(sd, &jo, now + 1));
+	datum_test(datum_stratum_block_is_wanted(sd, &j1, now + 1));          // only the last previous block is remembered
+	free(sd);
+	printf("  only a block the node took holds back the next on its previous block; refusals back off per job\n");
+}
+
+// The submit thread works on its own copy of the block: handed the stratum
+// thread's buffer, it read it while the next block was written over it.
+static void the_submit_thread_gets_its_own_copy(void) {
+	char buf[64];
+	strcpy(buf, "{\"params\":[\"block one\"]}");
+	datum_submitblock_trigger(buf, "hash1");
+	strcpy(buf, "{\"params\":[\"block two\"]}");
+	const char *p = datum_submitblock_pending();
+	datum_test(p != NULL && p != buf && !strcmp(p, "{\"params\":[\"block one\"]}"));
+	datum_submitblock_trigger(buf, "hash2");
+	p = datum_submitblock_pending();
+	datum_test(p != NULL && p != buf && !strcmp(p, "{\"params\":[\"block two\"]}"));
+	printf("  the submit thread gets its own copy of a block\n");
+}
+
 void datum_stratum_tests(void) {
+	a_submitblock_reply_is_read_for_what_it_says();
+	only_a_block_the_node_took_holds_back_the_next();
+	the_submit_thread_gets_its_own_copy();
 	the_client_difficulty_never_exceeds_the_networks();
 	coinbase_types_by_name_and_rule();
 	a_dropped_bmm_accept_makes_a_coinbase_unservable();

@@ -234,6 +234,113 @@ json_t *json_rpc_call(CURL *curl, const char *url, const char *userpass, const c
 	return json_rpc_call_full(curl, url, userpass, rpc_req, NULL, NULL);
 }
 
+// A JSON-RPC call whose reply is returned as it came, for a caller that has to
+// tell the kinds of failure apart: NULL only when no HTTP reply came at all
+// (connection, timeout). Without CURLOPT_FAILONERROR an HTTP error still gives
+// its body, which is where the node says what went wrong. *http_code gets the
+// status, or -1.
+char *json_rpc_call_raw(CURL *curl, const char *url, const char *userpass, const char *rpc_req, long *http_code) {
+	CURLcode rc;
+	struct data_buffer all_data = { };
+	struct upload_buffer upload_data;
+	struct curl_slist *headers = NULL;
+	char curl_err_str[CURL_ERROR_SIZE];
+	char *out = NULL;
+	
+	if (http_code) *http_code = -1;
+	curl_err_str[0] = 0;
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_ENCODING, "");
+	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &all_data);
+	curl_easy_setopt(curl, CURLOPT_READFUNCTION, upload_data_cb);
+	curl_easy_setopt(curl, CURLOPT_READDATA, &upload_data);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err_str);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	if (userpass) {
+		curl_easy_setopt(curl, CURLOPT_USERPWD, userpass);
+		curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+	}
+	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+	upload_data.buf = rpc_req;
+	upload_data.len = strlen(rpc_req);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)upload_data.len);
+	headers = curl_slist_append(headers, "Content-type: application/json");
+	headers = curl_slist_append(headers, "Expect:");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	
+	rc = curl_easy_perform(curl);
+	if (rc) {
+		DLOG_DEBUG("json_rpc_call_raw: HTTP request failed: %s", curl_err_str);
+	} else {
+		if (http_code) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
+		out = strdup(all_data.buf ? (const char *)all_data.buf : "");
+	}
+	databuf_free(&all_data);
+	curl_slist_free_all(headers);
+	curl_easy_reset(curl);
+	return out;
+}
+
+// What a submitblock reply says, read the way Bitcoin Core writes it (BIP22):
+// HTTP 200 with result null and error null is a block taken; a result string
+// is the node's reason for refusing it, except "duplicate", which is a block
+// it already has and holds valid (the submit thread often gets there first).
+// Anything else -- no reply, an HTTP error, a JSON-RPC error object, a reply
+// that does not parse or has no result -- says nothing about the block: it may
+// never have reached the node. json_rpc_call returns NULL for a block taken
+// and for every one of those alike, which is why this exists.
+int datum_submitblock_outcome(long http_code, const char *body, char *reason, size_t reason_sz) {
+	int outcome = DATUM_SUBMITBLOCK_FAILED;
+	json_error_t err;
+	json_t *j = NULL;
+	char tmp[256];
+	tmp[0] = 0;
+	
+	if (!body) {
+		snprintf(tmp, sizeof(tmp), "no reply from the node");
+		goto out;
+	}
+	j = JSON_LOADS(body, &err);
+	if (!j || !json_is_object(j)) {
+		snprintf(tmp, sizeof(tmp), "unreadable reply (HTTP %ld)", http_code);
+		goto out;
+	}
+	json_t * const e = json_object_get(j, "error");
+	json_t * const r = json_object_get(j, "result");
+	if (e && !json_is_null(e)) {
+		char *es = json_dumps(e, JSON_COMPACT | JSON_ENCODE_ANY);
+		snprintf(tmp, sizeof(tmp), "RPC error (HTTP %ld): %s", http_code, es ? es : "?");
+		free(es);
+		goto out;
+	}
+	if (http_code != 200) {
+		snprintf(tmp, sizeof(tmp), "HTTP %ld", http_code);
+		goto out;
+	}
+	if (!r) {
+		snprintf(tmp, sizeof(tmp), "reply without a result");
+		goto out;
+	}
+	if (json_is_null(r)) {
+		outcome = DATUM_SUBMITBLOCK_ACCEPTED;
+		goto out;
+	}
+	if (json_is_string(r)) {
+		snprintf(tmp, sizeof(tmp), "%s", json_string_value(r));
+		outcome = strcmp(json_string_value(r), "duplicate") ? DATUM_SUBMITBLOCK_REJECTED : DATUM_SUBMITBLOCK_ACCEPTED;
+		goto out;
+	}
+	snprintf(tmp, sizeof(tmp), "unexpected result");
+out:
+	if (j) json_decref(j);
+	if (reason && reason_sz) snprintf(reason, reason_sz, "%s", tmp);
+	return outcome;
+}
+
 bool update_rpc_cookie(global_config_t * const cfg) {
 	assert(!cfg->bitcoind_rpcuser[0]);
 	FILE * const F = fopen(cfg->bitcoind_rpccookiefile, "r");
@@ -266,4 +373,24 @@ json_t *bitcoind_json_rpc_call(CURL * const curl, global_config_t * const cfg, c
 	// Authentication failure using cookie; reload cookie file and try again
 	if (!update_rpc_cookie(cfg)) return NULL;
 	return json_rpc_call(curl, cfg->bitcoind_rpcurl, cfg->bitcoind_rpcuserpass, rpc_req);
+}
+
+// submitblock to our node (url NULL, with its credentials and a cookie
+// reload on 401) or to another URL; a DATUM_SUBMITBLOCK_* outcome, and the
+// node's reason or the failure in reason.
+int bitcoind_submitblock(CURL * const curl, global_config_t * const cfg, const char * const url, const char * const rpc_req, char * const reason, const size_t reason_sz) {
+	long http_code = -1;
+	char *body;
+	if (url) {
+		body = json_rpc_call_raw(curl, url, NULL, rpc_req, &http_code);
+	} else {
+		body = json_rpc_call_raw(curl, cfg->bitcoind_rpcurl, cfg->bitcoind_rpcuserpass, rpc_req, &http_code);
+		if (http_code == 401 && !cfg->bitcoind_rpcuser[0] && update_rpc_cookie(cfg)) {
+			free(body);
+			body = json_rpc_call_raw(curl, cfg->bitcoind_rpcurl, cfg->bitcoind_rpcuserpass, rpc_req, &http_code);
+		}
+	}
+	const int outcome = datum_submitblock_outcome(http_code, body, reason, reason_sz);
+	free(body);
+	return outcome;
 }

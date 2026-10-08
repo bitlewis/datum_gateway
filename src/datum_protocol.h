@@ -123,6 +123,10 @@ typedef struct {
 int datum_protocol_init(void);
 int datum_encrypt_generate_keys(DATUM_ENC_KEYS *keys);
 bool datum_protocol_is_active(void);
+// The longest coinbase tag taken from the pool: the same bound the gateway's own tags have.
+#define DATUM_POOL_TAG_MAX 60
+bool datum_pool_config_is_acceptable(const unsigned char *script, int script_len, int tag_len);
+int datum_protocol_client_configure(int len, unsigned char *data);
 void datum_increment_session_nonce(void *s);
 int datum_protocol_fetch_coinbaser(uint64_t value);
 // Forward the stratum credentials a rig authorised with, once per connection.

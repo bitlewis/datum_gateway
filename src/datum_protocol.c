@@ -433,13 +433,32 @@ int datum_protocol_ping_response(T_DATUM_PROTOCOL_HEADER *h, unsigned char *data
 	return 1;
 }
 
+// Whether the pool's configuration can be taken: its payout script a standard
+// address no longer than the job's pool_addr_script (64 bytes) -- up to 255
+// bytes used to be copied into it, past its end -- and its coinbase tag short
+// enough to fit (DATUM_POOL_TAG_MAX). An OP_RETURN or escrow script as the
+// pool's output is read by Chains as a BIP300 message in every block.
+bool datum_pool_config_is_acceptable(const unsigned char *script, int script_len, int tag_len) {
+	if (script_len < 1 || script_len > 64) return false;
+	if (!datum_payout_script_is_standard(script, script_len)) return false;
+	if (tag_len < 0 || tag_len > DATUM_POOL_TAG_MAX) return false;
+	return true;
+}
+
 int datum_protocol_client_configure(int len, unsigned char *data) {
 	// Server->Client configuration changes.  This can be called at any time by the server
 	// to make updates to these important variables.
+	//
+	// Read whole and checked before anything is taken: a configuration that is
+	// malformed or refused leaves the one in use as it was.
 	int i=0;
 	unsigned char a;
 	DLOG_DEBUG("client configuration cmd received from DATUM server");
 	char msg[1024];
+	const unsigned char *script, *tag;
+	int script_len, tag_len;
+	uint32_t prime_id;
+	uint64_t vardiff_min;
 	
 	if (i >= len || data[i] != 1) {
 err:
@@ -453,31 +472,42 @@ err:
 	if (i >= len) goto err;
 	a = data[i]; i++;
 	if (i + a > len) goto err;
-	memcpy(datum_config.override_mining_pool_scriptsig, &data[i], a); i+=a;
-	datum_config.override_mining_pool_scriptsig_len = a;
+	script = &data[i]; script_len = a; i+=a;
 	
 	// prime ID
 	if (i + 4 > len) goto err;
-	datum_config.prime_id = upk_u32le(data, i); i+=4;
+	prime_id = upk_u32le(data, i); i+=4;
 	
 	// pool coinbase tag
 	if (i >= len) goto err;
 	a = data[i]; i++;
 	if (i + a > len) goto err;
-	memcpy(datum_config.override_mining_coinbase_tag_primary, &data[i], a); i+=a;
-	datum_config.override_mining_coinbase_tag_primary[a] = 0;
+	tag = &data[i]; tag_len = a; i+=a;
 	
 	if (i + 8 > len) goto err;
-	datum_config.override_vardiff_min = upk_u64le(data, i); i+=8;
-	if (datum_config.override_vardiff_min != roundDownToPowerOfTwo_64(datum_config.override_vardiff_min)) {
-		DLOG_WARN("Server specified a minimum difficulty that is not a power of two! Is your client up to date? Rounding up to a power of two! (%"PRIu64" to %"PRIu64")", datum_config.override_vardiff_min, roundDownToPowerOfTwo_64(datum_config.override_vardiff_min)<<1);
-		datum_config.override_vardiff_min = roundDownToPowerOfTwo_64(datum_config.override_vardiff_min)<<1;
-	}
+	vardiff_min = upk_u64le(data, i); i+=8;
 	
 	if (i + 2 > len) goto err;
 	if ((data[i] != 0) || (data[i+1] != 0xFE)) {
 		DLOG_ERROR("Invalid data structure in configuration :(  Is this client up to date???");
 		return 0;
+	}
+	
+	if (!datum_pool_config_is_acceptable(script, script_len, tag_len)) {
+		DLOG_ERROR("DATUM server sent a payout script of %d bytes that is not a standard address of at most 64 bytes, "
+		           "or a coinbase tag of %d bytes (at most %d). Refusing its configuration.", script_len, tag_len, DATUM_POOL_TAG_MAX);
+		return 0;
+	}
+	
+	memcpy(datum_config.override_mining_pool_scriptsig, script, script_len);
+	datum_config.override_mining_pool_scriptsig_len = script_len;
+	datum_config.prime_id = prime_id;
+	memcpy(datum_config.override_mining_coinbase_tag_primary, tag, tag_len);
+	datum_config.override_mining_coinbase_tag_primary[tag_len] = 0;
+	datum_config.override_vardiff_min = vardiff_min;
+	if (datum_config.override_vardiff_min != roundDownToPowerOfTwo_64(datum_config.override_vardiff_min)) {
+		DLOG_WARN("Server specified a minimum difficulty that is not a power of two! Is your client up to date? Rounding up to a power of two! (%"PRIu64" to %"PRIu64")", datum_config.override_vardiff_min, roundDownToPowerOfTwo_64(datum_config.override_vardiff_min)<<1);
+		datum_config.override_vardiff_min = roundDownToPowerOfTwo_64(datum_config.override_vardiff_min)<<1;
 	}
 	
 	memset(msg, 0, (datum_config.override_mining_pool_scriptsig_len<<1)+2);

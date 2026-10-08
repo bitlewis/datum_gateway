@@ -1553,6 +1553,70 @@ static void the_empty_coinbase_pays_what_the_template_allows(void) {
 	printf("  the empty coinbase pays the template's subsidy, not Bitcoin's schedule\n");
 }
 
+extern unsigned char datum_state;
+
+// A DATUM configure command: version, payout script, prime ID, tag, minimum difficulty, end.
+static int configure_msg(unsigned char *m, const unsigned char *script, int slen, const char *tag, int tlen) {
+	int i = 0;
+	m[i++] = 1;
+	m[i++] = (unsigned char)slen; memcpy(&m[i], script, slen); i += slen;
+	pk_u32le(m, i, 0x01020304); i += 4;
+	m[i++] = (unsigned char)tlen; memcpy(&m[i], tag, tlen); i += tlen;
+	pk_u64le(m, i, 65536); i += 8;
+	m[i++] = 0; m[i++] = 0xFE;
+	return i;
+}
+
+// The pool's payout script went into the configuration unchecked: up to 255
+// bytes copied into a job's 64-byte pool_addr_script, and whatever script it
+// was paid in every block -- an OP_RETURN there is a BIP300 message Chains
+// reads. And a tag long enough panicked the gateway. Refused now, and the
+// configuration in use stays.
+static void a_pool_configuration_is_checked_before_it_is_taken(void) {
+	static unsigned char m[1024];
+	const unsigned char p2wpkh[22] = { 0x00, 0x14, 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 };
+	unsigned char long_script[100];
+	memset(long_script, 0x51, sizeof(long_script));
+	const unsigned char op_return[] = { 0x6a, 0x04, 0xd7, 0x7d, 0x17, 0x76 };
+	char tag[256];
+	memset(tag, 'T', sizeof(tag));
+	const unsigned char saved_state = datum_state;
+	unsigned char saved_script[sizeof(datum_config.override_mining_pool_scriptsig)];
+	char saved_tag[sizeof(datum_config.override_mining_coinbase_tag_primary)];
+	const int saved_len = datum_config.override_mining_pool_scriptsig_len;
+	const uint32_t saved_prime = datum_config.prime_id;
+	const uint64_t saved_min = datum_config.override_vardiff_min;
+	memcpy(saved_script, datum_config.override_mining_pool_scriptsig, sizeof(saved_script));
+	memcpy(saved_tag, datum_config.override_mining_coinbase_tag_primary, sizeof(saved_tag));
+	
+	datum_test(datum_protocol_client_configure(configure_msg(m, p2wpkh, 22, "OCEAN.XYZ", 9), m) == 1);
+	datum_test(datum_config.override_mining_pool_scriptsig_len == 22 && !memcmp(datum_config.override_mining_pool_scriptsig, p2wpkh, 22));
+	datum_test(!strcmp(datum_config.override_mining_coinbase_tag_primary, "OCEAN.XYZ") && datum_config.prime_id == 0x01020304);
+	datum_test(datum_protocol_client_configure(configure_msg(m, p2wpkh, 22, tag, DATUM_POOL_TAG_MAX), m) == 1);
+	// Refused, and nothing of them taken.
+	strcpy(datum_config.override_mining_coinbase_tag_primary, "OCEAN.XYZ");
+	datum_config.prime_id = 7;
+	datum_test(datum_protocol_client_configure(configure_msg(m, long_script, 100, "x", 1), m) == 0);
+	datum_test(datum_protocol_client_configure(configure_msg(m, op_return, sizeof(op_return), "x", 1), m) == 0);
+	datum_test(datum_protocol_client_configure(configure_msg(m, p2wpkh, 22, tag, DATUM_POOL_TAG_MAX + 1), m) == 0);
+	datum_test(datum_protocol_client_configure(configure_msg(m, p2wpkh, 22, tag, 255), m) == 0);
+	datum_test(datum_protocol_client_configure(configure_msg(m, p2wpkh, 0, "x", 1), m) == 0);
+	datum_test(datum_config.override_mining_pool_scriptsig_len == 22 && !memcmp(datum_config.override_mining_pool_scriptsig, p2wpkh, 22));
+	datum_test(!strcmp(datum_config.override_mining_coinbase_tag_primary, "OCEAN.XYZ") && datum_config.prime_id == 7);
+	// Cut short: refused too, before anything is taken.
+	const int n = configure_msg(m, p2wpkh, 22, "NEW", 3);
+	datum_test(datum_protocol_client_configure(n - 3, m) == 0);
+	datum_test(!strcmp(datum_config.override_mining_coinbase_tag_primary, "OCEAN.XYZ"));
+	
+	memcpy(datum_config.override_mining_pool_scriptsig, saved_script, sizeof(saved_script));
+	memcpy(datum_config.override_mining_coinbase_tag_primary, saved_tag, sizeof(saved_tag));
+	datum_config.override_mining_pool_scriptsig_len = saved_len;
+	datum_config.prime_id = saved_prime;
+	datum_config.override_vardiff_min = saved_min;
+	datum_state = saved_state;
+	printf("  the pool's configuration is refused unless its payout is a standard address and its tag fits\n");
+}
+
 // A refused template for a new block used to keep the previous job, leaving
 // every miner on the block before. Its header is enough for empty work: a
 // block with no transactions, no commitments and the subsidy alone.
@@ -1644,6 +1708,7 @@ void datum_blocktemplates_tests(void) {
 	a_long_tag_leaves_coinbase_0_alone();
 	a_tag_too_long_is_cut_not_fatal();
 	the_empty_coinbase_pays_what_the_template_allows();
+	a_pool_configuration_is_checked_before_it_is_taken();
 	a_refused_template_still_moves_miners_to_the_new_block();
 	a_chain_without_segwit_gets_a_coinbase_without_the_commitment();
 	the_parser_drops_bids_when_there_is_no_enforcer();

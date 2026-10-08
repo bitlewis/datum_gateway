@@ -770,10 +770,32 @@ void reset_vardiff_stats(T_DATUM_CLIENT_DATA *c) {
 // submitted, and the block is lost. The cap moves only the target the client
 // is told: the PoT byte in the coinbase, and so what the pool is sent, stays
 // the pool difficulty (see datum_stratum_share_is_for_pool).
-uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap) {
+//
+// told_floor is the least a client takes at all (NiceHash: 524288). Below it
+// the cap is not applied: such a client refuses the difficulty, and blocks
+// between its floor and the network's are lost to it either way.
+uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap, uint64_t told_floor) {
 	if (!pool_diff) pool_diff = 1;
-	if (diff_cap && pool_diff > diff_cap) return diff_cap;
-	return pool_diff;
+	uint64_t d = pool_diff;
+	if (diff_cap && d > diff_cap) d = diff_cap;
+	if (told_floor && d < told_floor) d = (told_floor < pool_diff) ? told_floor : pool_diff;
+	return d;
+}
+
+// Whether a share meets the target its work was sent with (1), or misses it
+// but meets the lower difficulty the client was told since (2), or neither
+// (0). A set_difficulty is sent before the notify of the job it is for, and a
+// miner may apply it to the work it holds: a capped job's lower difficulty
+// then reaches the work of the job before. Such a share is acknowledged, not
+// rejected as a high hash; it misses the work's own difficulty, so it is
+// never one for the pool and counts for nothing (a block among them was
+// already checked for).
+int datum_stratum_share_meets_target(const unsigned char *share_hash, const unsigned char *work_target, uint64_t work_sdiff, uint64_t told_sdiff) {
+	unsigned char t[32];
+	if (compare_hashes(share_hash, work_target) <= 0) return 1;
+	if (!told_sdiff || told_sdiff >= work_sdiff) return 0;
+	get_target_from_diff(t, told_sdiff);
+	return compare_hashes(share_hash, t) <= 0 ? 2 : 0;
 }
 
 // Whether a share that met the target the client was told (sent_diff) also
@@ -1131,7 +1153,11 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		return 0;
 	}
 	
-	const uint64_t job_diff = quickdiff ? m->quickdiff_value : m->stratum_job_diffs[g_job_index];
+	// The slot this work's difficulty was kept in (see send_mining_notify).
+	const uint64_t job_diff = quickdiff ? m->quickdiff_value : (empty_work ? m->stratum_job_empty_diffs[g_job_index] : m->stratum_job_diffs[g_job_index]);
+	const uint64_t job_sdiff = quickdiff ? m->quickdiff_sdiff : (empty_work ? m->stratum_job_empty_sdiffs[g_job_index] : m->stratum_job_sdiffs[g_job_index]);
+	const unsigned char *const job_target = quickdiff ? m->quickdiff_target : (empty_work ? m->stratum_job_empty_targets[g_job_index] : m->stratum_job_targets[g_job_index]);
+	bool told_lower_since = false;
 	
 	// construct block header
 	bver = job->version_uint;
@@ -1243,7 +1269,7 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		}
 		full_cb_txn[job->target_pot_index] = floorPoT(m->quickdiff_value);
 	} else {
-		full_cb_txn[job->target_pot_index] = floorPoT(m->stratum_job_diffs[g_job_index]);
+		full_cb_txn[job->target_pot_index] = floorPoT(job_diff);
 	}
 	
 	if ((job->merklebranch_count) && (!empty_work)) {
@@ -1389,25 +1415,17 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		return 0;
 	}
 	
-	// check if share beats miner's work target
-	if (!quickdiff) {
-		// check against job+connection target
-		if (compare_hashes(share_hash, m->stratum_job_targets[g_job_index]) > 0) {
+	// check if share beats miner's work target (the job's, the quickdiff's or the empty work's),
+	// or the lower one the client was told since (datum_stratum_share_meets_target)
+	switch (datum_stratum_share_meets_target(share_hash, job_target, job_sdiff, m->last_sent_stratum_diff)) {
+		case 1: break;
+		case 2: told_lower_since = true; break;
+		default:
 			// bad target diff
 			send_rejected_high_hash_error(c, id);
 			m->share_count_rejected++;
 			m->share_diff_rejected += job_diff;
 			return 0;
-		}
-	} else {
-		// check against quickdiff target instead
-		if (compare_hashes(share_hash, m->quickdiff_target) > 0) {
-			// bad target diff
-			send_rejected_high_hash_error(c, id);
-			m->share_count_rejected++;
-			m->share_diff_rejected += job_diff;
-			return 0;
-		}
 	}
 	
 	// check if stale
@@ -1433,7 +1451,7 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	// the network's): the pool never sees those, and the client's stats and
 	// vardiff count only shares at the pool difficulty, as they always have.
 	// A block among them was handled above.
-	if (!datum_stratum_share_is_for_pool(share_hash, quickdiff ? m->quickdiff_sdiff : m->stratum_job_sdiffs[g_job_index], job_diff)) {
+	if (told_lower_since || !datum_stratum_share_is_for_pool(share_hash, job_sdiff, job_diff)) {
 		char s[256];
 		snprintf(s, sizeof(s), "{\"error\":null,\"id\":%"PRIu64",\"result\":true}\n", id);
 		datum_socket_send_string_to_client(c, s);
@@ -1742,22 +1760,8 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 	// if we have an updated difficulty to send, send it before we send the notify
 	// applies to quick and normal diff changes, and to a job whose network
 	// difficulty caps the client's differently from the last one's
-	if ((m->last_sent_diff != m->current_diff) || (m->last_sent_stratum_diff != datum_stratum_client_diff(m->current_diff, j->diff_cap))) {
+	if ((m->last_sent_diff != m->current_diff) || (m->last_sent_stratum_diff != datum_stratum_client_diff(m->current_diff, j->diff_cap, m->told_diff_floor))) {
 		send_mining_set_difficulty_for_job(c, j);
-	}
-	
-	// if this is a quick diff change, the job is likely identical to one we've already sent
-	// in which case, we don't want to clobber the normal target table and reject shares that we shouldn't
-	if (!quickdiff) {
-		get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_stratum_diff);
-		m->stratum_job_diffs[j->global_index] = m->last_sent_diff;
-		m->stratum_job_sdiffs[j->global_index] = m->last_sent_stratum_diff;
-		m->quickdiff_active = false;
-	} else {
-		m->quickdiff_active = true;
-		m->quickdiff_value = m->last_sent_diff;
-		m->quickdiff_sdiff = m->last_sent_stratum_diff;
-		get_target_from_diff(m->quickdiff_target, m->quickdiff_sdiff);
 	}
 	
 	if (j->job_state >= JOB_STATE_FULL_PRIORITY_WAIT_COINBASER) {
@@ -1809,16 +1813,32 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 		}
 		new_block = true;
 		// An empty job is a new job, not the same job at a new difficulty.
-		if (quickdiff) {
-			// The targets above were set for a quick difficulty change: set them as for a new job,
-			// or the coinbase rebuilt for its shares would have the old difficulty's PoT byte, and
-			// every share -- and a block found on it -- would fail.
-			get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_stratum_diff);
-			m->stratum_job_diffs[j->global_index] = m->last_sent_diff;
-			m->stratum_job_sdiffs[j->global_index] = m->last_sent_stratum_diff;
-			m->quickdiff_active = false;
-		}
 		quickdiff = false;
+	}
+	
+	// The difficulty and target the work is sent with, each kind in its own
+	// slot, as its shares are checked against them: full work per job, quick
+	// difficulty work in the quickdiff slot (the job is likely identical to
+	// one already sent, and its full work is still out there), and empty (N)
+	// work per job in a slot of its own. Empty work on a job used to take the
+	// job's full-work slot, and the client may still hold full work on that
+	// job: its shares were then checked -- and its coinbase rebuilt, PoT byte
+	// and all -- at the other difficulty, and failed, a block among them too.
+	if (new_block) {
+		get_target_from_diff(m->stratum_job_empty_targets[j->global_index], m->last_sent_stratum_diff);
+		m->stratum_job_empty_diffs[j->global_index] = m->last_sent_diff;
+		m->stratum_job_empty_sdiffs[j->global_index] = m->last_sent_stratum_diff;
+		m->quickdiff_active = false;
+	} else if (!quickdiff) {
+		get_target_from_diff(m->stratum_job_targets[j->global_index], m->last_sent_stratum_diff);
+		m->stratum_job_diffs[j->global_index] = m->last_sent_diff;
+		m->stratum_job_sdiffs[j->global_index] = m->last_sent_stratum_diff;
+		m->quickdiff_active = false;
+	} else {
+		m->quickdiff_active = true;
+		m->quickdiff_value = m->last_sent_diff;
+		m->quickdiff_sdiff = m->last_sent_stratum_diff;
+		get_target_from_diff(m->quickdiff_target, m->quickdiff_sdiff);
 	}
 	
 	cb = &j->coinbase[cbselect];
@@ -1906,7 +1926,7 @@ static int send_mining_set_difficulty_for_job(T_DATUM_CLIENT_DATA *c, const T_DA
 		m->current_diff = datum_config.stratum_v1_vardiff_min;
 	}
 	
-	const uint64_t sdiff = datum_stratum_client_diff(m->current_diff, j ? j->diff_cap : 0);
+	const uint64_t sdiff = datum_stratum_client_diff(m->current_diff, j ? j->diff_cap : 0, m->told_diff_floor);
 	snprintf(s, sizeof(s), "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[%"PRIu64"]}\n", sdiff);
 	datum_socket_send_string_to_client(c, s);
 	
@@ -2021,6 +2041,8 @@ void datum_stratum_fingerprint_by_UA(T_DATUM_MINER_DATA *m) {
 	if (strstr(m->useragent, "NiceHash/") == m->useragent) {
 		m->current_diff=524288;
 		m->forced_high_min_diff=524288;
+		// Not even capped at the network's below it (datum_stratum_client_diff).
+		m->told_diff_floor=524288;
 		m->coinbase_selection = 1; // TINY
 		return;
 	}

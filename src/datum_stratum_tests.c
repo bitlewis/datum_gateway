@@ -315,11 +315,11 @@ static void the_client_difficulty_never_exceeds_the_networks(void) {
 	datum_test(cap > 80000000000000ULL && cap < 90000000000000ULL);
 	
 	// What the client is told.
-	datum_test(datum_stratum_client_diff(65536, 1) == 1);
-	datum_test(datum_stratum_client_diff(524288, 256) == 256);
-	datum_test(datum_stratum_client_diff(65536, cap) == 65536);
-	datum_test(datum_stratum_client_diff(65536, 0) == 65536);  // no cap known
-	datum_test(datum_stratum_client_diff(0, 1) == 1);
+	datum_test(datum_stratum_client_diff(65536, 1, 0) == 1);
+	datum_test(datum_stratum_client_diff(524288, 256, 0) == 256);
+	datum_test(datum_stratum_client_diff(65536, cap, 0) == 65536);
+	datum_test(datum_stratum_client_diff(65536, 0, 0) == 65536);  // no cap known
+	datum_test(datum_stratum_client_diff(0, 1, 0) == 1);
 	
 	// A share at the client's target goes to the pool only if it meets the pool difficulty.
 	unsigned char h[32];
@@ -357,7 +357,7 @@ static void the_client_difficulty_never_exceeds_the_networks(void) {
 	// The empty work of a new block gets the same.
 	c->out_buf = 0; memset(c->w_buffer, 0, 256);
 	datum_test(send_mining_notify(c, true, false, true) == 0);
-	datum_test(m->stratum_job_sdiffs[7] == 1 && last_pot_byte(c, jmin.target_pot_index) == floorPoT(524288));
+	datum_test(m->stratum_job_empty_sdiffs[7] == 1 && m->stratum_job_empty_diffs[7] == 524288 && last_pot_byte(c, jmin.target_pot_index) == floorPoT(524288));
 	
 	// The next job is at a mainnet difficulty: the client is told its own again.
 	fake_job(&jmain, 8, 0x17034219);
@@ -379,6 +379,65 @@ static void the_client_difficulty_never_exceeds_the_networks(void) {
 	datum_test(m->quickdiff_sdiff == 1 && m->quickdiff_value == 1048576);
 	datum_test(!memcmp(m->quickdiff_target, t, 32));
 	printf("  a client is sent difficulty 1 on a min-difficulty block and its own on the next, the PoT byte unchanged\n");
+	
+	// NiceHash takes nothing below 524288: never told less, cap or not.
+	datum_test(datum_stratum_client_diff(524288, 1, 524288) == 524288);
+	datum_test(datum_stratum_client_diff(1048576, 1, 524288) == 524288);
+	datum_test(datum_stratum_client_diff(1048576, 600000, 524288) == 600000);
+	datum_test(datum_stratum_client_diff(1024, 1, 524288) == 1024);       // never above the pool difficulty
+	{
+		T_DATUM_MINER_DATA *nm = calloc(1, sizeof(*nm));
+		T_DATUM_CLIENT_DATA *nc = calloc(1, sizeof(*nc));
+		if (datum_test(nm && nc)) {
+			nc->datum_thread = td;
+			nc->app_client_data = nm;
+			nm->sdata = sd;
+			strcpy(nm->useragent, "NiceHash/1.0.0");
+			datum_stratum_fingerprint_by_UA(nm);
+			datum_test(nm->told_diff_floor == 524288 && nm->current_diff == 524288);
+			sd->cur_stratum_job = &jmin;
+			datum_test(send_mining_notify(nc, true, false, false) == 0);
+			datum_test(last_set_difficulty(nc) == 524288 && nm->stratum_job_sdiffs[7] == 524288);
+		}
+		free(nm); free(nc);
+	}
+	printf("  NiceHash is never sent a difficulty below its floor\n");
+	
+	// Empty work keeps its own slot. Full work on a job at one difficulty, then
+	// a quick change that is served as empty work (the job became unservable):
+	// the full work's difficulty and target stay as they were sent.
+	fake_job(&jmain, 9, 0x17034219);
+	sd->cur_stratum_job = &jmain;
+	m->current_diff = 65536;
+	m->forced_high_min_diff = 0;
+	c->out_buf = 0; memset(c->w_buffer, 0, 256);
+	datum_test(send_mining_notify(c, true, false, false) == 0);
+	datum_test(m->stratum_job_diffs[9] == 65536 && m->stratum_job_sdiffs[9] == 65536);
+	jmain.has_bmm_request = true;                            // no accept: only empty work is safe
+	m->current_diff = 131072;
+	c->out_buf = 0; memset(c->w_buffer, 0, 256);
+	datum_test(send_mining_notify(c, true, true, false) == 0);
+	datum_test(strstr(c->w_buffer, "\"N") != NULL && last_pot_byte(c, jmain.target_pot_index) == floorPoT(131072));
+	datum_test(m->stratum_job_empty_diffs[9] == 131072 && m->stratum_job_empty_sdiffs[9] == 131072);
+	datum_test(m->stratum_job_diffs[9] == 65536 && m->stratum_job_sdiffs[9] == 65536);
+	get_target_from_diff(t, 65536);
+	datum_test(!memcmp(m->stratum_job_targets[9], t, 32));
+	printf("  empty work keeps its difficulty apart from the full work of the same job\n");
+	
+	// A share on earlier work, after a set_difficulty for a capped job lowered
+	// what the client was told: acknowledged (2), not rejected; never for the pool.
+	{
+		unsigned char wt[32], sh[32];
+		get_target_from_diff(wt, 524288);
+		get_target_from_diff(sh, 2);                               // a hash at difficulty 2
+		datum_test(datum_stratum_share_meets_target(sh, wt, 524288, 1) == 2);
+		datum_test(datum_stratum_share_meets_target(sh, wt, 524288, 4) == 0);   // misses that too
+		datum_test(datum_stratum_share_meets_target(sh, wt, 524288, 524288) == 0);
+		datum_test(datum_stratum_share_meets_target(sh, wt, 524288, 0) == 0);
+		get_target_from_diff(sh, 1048576);
+		datum_test(datum_stratum_share_meets_target(sh, wt, 524288, 1) == 1);
+	}
+	printf("  a share at a lower difficulty the client was told since is acknowledged, not rejected\n");
 	
 	free(m); free(c); free(sd); free(td);
 }

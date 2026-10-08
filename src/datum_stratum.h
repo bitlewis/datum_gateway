@@ -296,6 +296,13 @@ typedef struct {
 	uint8_t stratum_job_targets[MAX_STRATUM_JOBS][32];
 	uint64_t stratum_job_diffs[MAX_STRATUM_JOBS];
 	uint64_t stratum_job_sdiffs[MAX_STRATUM_JOBS];
+	// The same for the empty (N) work of each job, which the client may hold
+	// beside the job's full work at another difficulty.
+	uint8_t stratum_job_empty_targets[MAX_STRATUM_JOBS][32];
+	uint64_t stratum_job_empty_diffs[MAX_STRATUM_JOBS];
+	uint64_t stratum_job_empty_sdiffs[MAX_STRATUM_JOBS];
+	// The least difficulty the client may be told at all (NiceHash), 0 if none.
+	uint64_t told_diff_floor;
 	
 	unsigned char coinbase_selection;
 	// The client chose its coinbase type itself (cb= in its password): kept over defaults and fingerprints.
@@ -340,10 +347,12 @@ void datum_job_note_bmm_accept(T_DATUM_STRATUM_JOB *s);
 void datum_job_note_bmm_request(T_DATUM_STRATUM_JOB *s);
 int datum_stratum_coinbase_type_by_name(const char *s);
 int datum_stratum_coinbase_type_from_rules(const char *ua);
+void datum_stratum_fingerprint_by_UA(T_DATUM_MINER_DATA *m);
 int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t coinbase_txn_size, T_DATUM_STRATUM_JOB *job, T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const char *block_hash_hex, bool empty_work);
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only);
 int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c);
-uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap);
+uint64_t datum_stratum_client_diff(uint64_t pool_diff, uint64_t diff_cap, uint64_t told_floor);
+int datum_stratum_share_meets_target(const unsigned char *share_hash, const unsigned char *work_target, uint64_t work_sdiff, uint64_t told_sdiff);
 bool datum_stratum_share_is_for_pool(const unsigned char *share_hash, uint64_t sent_diff, uint64_t pool_diff);
 // How long a block the node took on a previous block holds off more on it
 // while the gateway still sees that previous block as the tip; and the backoff

@@ -1048,8 +1048,12 @@ bool datum_m4_fits_template(const unsigned char *script, int len, const T_DATUM_
 		for (int v = 0; v < body / 2; v++) {
 			const unsigned int e = (unsigned int)script[i + 2*v] | ((unsigned int)script[i + 2*v + 1] << 8);
 			if (e != 0xFFFF && e != 0xFFFE && e >= t->votable_bundles[v]) return false;
-			// The two byte form only where an entry does not fit in one.
-			if (e > 0xFD && e != 0xFFFF && e != 0xFFFE) needed = true;
+			// The two byte form only where an entry does not fit in one, as
+			// Chains counts it (scdb.cpp: refused only when every entry is at
+			// most 0xFD, VOTE_MAX_ONE_BYTE_INDEX). Abstain (0xFFFF) and
+			// downvote (0xFFFE) are above that, so a vector of only those is
+			// a valid two byte vote.
+			if (e > 0xFD) needed = true;
 		}
 		return needed;
 	}

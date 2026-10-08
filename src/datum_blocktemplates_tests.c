@@ -215,10 +215,27 @@ static void a_pool_vote_has_to_fit_the_template(void) {
 	t.votable_bundles[0] = 1;
 	t.votable_count = 3;
 	datum_test(!datum_m4_fits_template(one_byte, sizeof(one_byte), &t));
-	// Two bytes where one would do.
+	// Two bytes where one would do: refused only when every entry is at most
+	// 0xFD, as Chains has it. An abstain or a downvote is above that.
 	t.votable_count = 2;
 	const unsigned char two_bytes[] = { 0x6a, 0x09, 0xd7, 0x7d, 0x17, 0x76, 0x02, 0x00, 0x00, 0xff, 0xff };
-	datum_test(!datum_m4_fits_template(two_bytes, sizeof(two_bytes), &t));
+	datum_test(datum_m4_fits_template(two_bytes, sizeof(two_bytes), &t));
+	const unsigned char two_bytes_down[] = { 0x6a, 0x09, 0xd7, 0x7d, 0x17, 0x76, 0x02, 0xfe, 0xff, 0xff, 0xff };
+	datum_test(datum_m4_fits_template(two_bytes_down, sizeof(two_bytes_down), &t));
+	const unsigned char two_bytes_small[] = { 0x6a, 0x09, 0xd7, 0x7d, 0x17, 0x76, 0x02, 0x00, 0x00, 0xfd, 0x00 };
+	datum_test(!datum_m4_fits_template(two_bytes_small, sizeof(two_bytes_small), &t));
+	// 0xFE as a two byte entry is a bundle index past what is pending here.
+	const unsigned char two_bytes_fe[] = { 0x6a, 0x09, 0xd7, 0x7d, 0x17, 0x76, 0x02, 0x00, 0x00, 0xfe, 0x00 };
+	datum_test(!datum_m4_fits_template(two_bytes_fe, sizeof(two_bytes_fe), &t));
+	t.votable_bundles[1] = 0xFF;
+	datum_test(datum_m4_fits_template(two_bytes_fe, sizeof(two_bytes_fe), &t));
+	t.votable_bundles[1] = 0;
+	// No sidechain at all: an empty two byte vector is refused, an empty one byte one is not.
+	t.votable_count = 0;
+	const unsigned char two_empty[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x02 };
+	const unsigned char one_empty[] = { 0x6a, 0x05, 0xd7, 0x7d, 0x17, 0x76, 0x01 };
+	datum_test(!datum_m4_fits_template(two_empty, sizeof(two_empty), &t));
+	datum_test(datum_m4_fits_template(one_empty, sizeof(one_empty), &t));
 	printf("  a vote the pool sends has to fit the template's sidechains and bundles\n");
 }
 
